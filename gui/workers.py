@@ -15,8 +15,9 @@ status:
 
 Where the progress figures come from is each worker's business and stops here.
 Downloads read ``DownloadManager.get_status``, which is a real live API. Benchmarks
-tail the execution log, because MSHCore returns nothing until every prompt has run —
-if MSHCore later grows a progress callback, only ``_run_benchmark`` changes.
+are handed their figures by MSHCore itself, through the ``on_progress`` callback it
+invokes before every prompt and after every finished repetition; the worker only
+reshapes those dicts into job steps.
 """
 
 from __future__ import annotations
@@ -32,7 +33,6 @@ from typing import Any
 # class in memory, so a token handed to MSHCore and the OperationCancelled caught
 # back from it would come from different copies, and `except
 # OperationCancelled` would silently miss the cancellation.
-from MSHCore import logging as core_logging
 from MSHCore.benchmark import ollama_runner
 from MSHCore.cancellation import CancellationToken, OperationCancelled
 from MSHCore.download_manager.manager import DownloadManager
@@ -48,7 +48,6 @@ from .jobs import (
     Metric,
     registry,
 )
-from .logtail import LogTail
 
 # How often a worker reads its progress source.
 POLL_SECONDS = 0.4
@@ -59,10 +58,6 @@ CANCEL_TIMEOUT = 60.0
 # How long a download worker waits for the manager's thread to exit after a
 # cancellation, so the final snapshot describes the state after cleanup.
 WORKER_STOP_TIMEOUT = 30.0
-
-# How long a benchmark waits for its log reader to drain. MSHCore writes the last
-# prompt's entry immediately before returning, routinely after the last read.
-DRAIN_TIMEOUT = 5.0
 
 # DownloadManager's per-item statuses, mapped onto step states.
 DOWNLOAD_STEP_STATES = {
@@ -76,10 +71,6 @@ DOWNLOAD_STEP_STATES = {
     "skipped": SKIPPED,
     "cancelled": CANCELLED,
 }
-
-# The component name MSHCore's benchmark runner writes its per-prompt entries
-# under, mirrored here so the log tail can pick them out.
-BENCHMARK_COMPONENT = "benchmark/ollama_runner"
 
 
 def _spawn(job: Job, target: Callable[[], None], name: str) -> None:
@@ -406,42 +397,47 @@ def note_download_ended(session_id: str, reason: str) -> bool:
 # ============================================================
 
 def start_benchmark(
-    model: str,
-    prompts: list[str],
-    configurations: list[dict],
+    experiments: list[dict],
+    shared_prompts: list[str] | None,
     include_output: bool,
     repetitions: int = 1,
 ) -> Job:
-    """Begin a benchmark or configuration comparison and run it on a worker thread.
+    """Begin a benchmark matrix and run it on a worker thread.
 
-    One entry point for both shapes. A single test is one configuration with one
-    row per prompt; a comparison is several, with one row per configuration. Both
-    call ``ollama_runner.compare_tests``, so MSHCore does the normalisation either
-    way and this layer has one result shape to classify.
+    Calls ``ollama_runner.run_benchmark``, so MSHCore normalises the matrix
+    and this layer has one result shape to classify. One row is created per
+    model-configuration pair before MSHCore runs — one row per prompt
+    instead when the matrix is a single pair, so the panel shows the shape
+    of the work rather than an empty indeterminate bar.
 
     Args:
-        model: Model name or tag to benchmark.
-        prompts: Prompts to run against every configuration.
-        configurations: Normalised configurations, each ``{"name", "options"}``.
+        experiments: One dict per model, in run order: 'model' plus optional
+            'configurations', each carrying 'name', 'options' and an optional
+            'prompts' list only that configuration answers.
+        shared_prompts: Prompts every configuration answers before its own,
+            or None when every configuration carries its own.
         include_output: Whether to include generated text in the results.
         repetitions: How many times every prompt runs per configuration, from 1.
 
     Returns:
         Job: The job, already persisted, whose id the panel polls.
     """
-    single = len(configurations) == 1
+    prompts = list(shared_prompts or [])
+    pairs = _matrix_pairs(experiments)
+    models = _matrix_models(experiments)
+    single = len(pairs) == 1 and bool(prompts)
 
     job = Job(
         kind="benchmark",
         title=(
-            f"Benchmarking {model}"
-            if single
-            else f"Comparing {len(configurations)} configuration(s)"
+            f"Benchmarking {models[0]}"
+            if single or len(models) == 1
+            else f"Comparing {len(models)} model(s)"
         ),
         message=(
-            f"{len(prompts)} prompt(s) · {configurations[0]['name']}"
+            f"{len(prompts)} prompt(s) · {pairs[0][1]}"
             if single
-            else f"{model} · {len(prompts)} prompt(s) each"
+            else f"{len(pairs)} configuration(s) · {len(prompts)} prompt(s) each"
         ),
     )
 
@@ -450,8 +446,9 @@ def start_benchmark(
     if single:
         job.add_steps([f"prompt {index}" for index in range(1, len(prompts) + 1)])
     else:
+        multi_model = len(models) > 1
         job.add_steps(
-            [configuration["name"] for configuration in configurations],
+            [_pair_label(model, name, multi_model) for model, name in pairs],
             weight=float(len(prompts) or 1),
         )
 
@@ -459,13 +456,18 @@ def start_benchmark(
     job.set_cancel(token.cancel)
 
     def run(cancellation: CancellationToken) -> dict:
-        return ollama_runner.compare_tests(
-            model=model,
-            prompts=prompts,
-            configurations=configurations,
+        return ollama_runner.run_benchmark(
+            experiments=experiments,
+            shared_prompts=shared_prompts or None,
             include_output=include_output,
             cancellation=cancellation,
             repetitions=repetitions,
+            on_progress=_on_progress(
+                job,
+                rows=None
+                if single
+                else {(model, name): index for index, (model, name) in enumerate(pairs)},
+            ),
         )
 
     _spawn(
@@ -473,8 +475,6 @@ def start_benchmark(
         lambda: _run_benchmark(
             job=job,
             token=token,
-            names=[configuration["name"] for configuration in configurations],
-            prompt_count=len(prompts),
             single=single,
             run=run,
         ),
@@ -484,70 +484,190 @@ def start_benchmark(
     return job
 
 
-def start_model_comparison(
-    models: list[str],
-    prompts: list[str],
-    config: dict | None,
-    include_output: bool,
-    repetitions: int = 1,
-) -> Job:
-    """Begin a cross-model comparison and run it on a worker thread.
+def _matrix_pairs(experiments: list[dict]) -> list[tuple[str, str]]:
+    """List the model-configuration pairs a matrix will run, in run order.
 
-    Calls ``ollama_runner.compare_models``: one shared configuration, the same
-    prompts, and one row per model — MSHCore unloads each model before the
-    next loads, so timings never compete for VRAM.
+    Mirrors MSHCore's own normalisation so the rows can be named before it
+    runs: a model with no configurations runs once under 'default', and a
+    configuration without a name takes its position.
 
     Args:
-        models: Model names or tags, in run order.
-        prompts: Prompts every model answers.
-        config: Generation options shared by every model, or None.
-        include_output: Whether to include generated text in the results.
-        repetitions: How many times every prompt runs per model, from 1.
+        experiments: The matrix as given to the worker.
 
     Returns:
-        Job: The job, already persisted, whose id the panel polls.
+        list[tuple[str, str]]: One (model, configuration name) per pair.
     """
-    job = Job(
-        kind="benchmark",
-        title=f"Comparing {len(models)} model(s)",
-        message=f"{', '.join(models)} · {len(prompts)} prompt(s) each",
-    )
-    job.add_steps(models, weight=float(len(prompts) or 1))
+    pairs: list[tuple[str, str]] = []
 
-    token = CancellationToken()
-    job.set_cancel(token.cancel)
+    for experiment in experiments:
+        model = experiment["model"]
+        configurations = experiment.get("configurations")
 
-    def run(cancellation: CancellationToken) -> dict:
-        return ollama_runner.compare_models(
-            models=models,
-            prompts=prompts,
-            config=config,
-            include_output=include_output,
-            cancellation=cancellation,
-            repetitions=repetitions,
+        if configurations is None:
+            pairs.append((model, "default"))
+            continue
+
+        for index, configuration in enumerate(configurations, start=1):
+            name = (
+                configuration.get("name")
+                if isinstance(configuration, dict)
+                else None
+            )
+            pairs.append(
+                (
+                    model,
+                    name if isinstance(name, str) and name else f"configuration_{index}",
+                )
+            )
+
+    return pairs
+
+
+def _matrix_models(experiments: list[dict]) -> list[str]:
+    """List a matrix's distinct model names, in run order.
+
+    Args:
+        experiments: The matrix as given to the worker.
+
+    Returns:
+        list[str]: First occurrence of each model name.
+    """
+    models: list[str] = []
+
+    for experiment in experiments:
+        model = experiment["model"]
+
+        if model not in models:
+            models.append(model)
+
+    return models
+
+
+def _pair_label(model: str, name: str, multi_model: bool) -> str:
+    """Name one model-configuration pair the way a panel row shows it.
+
+    A matrix spanning several models can carry two configurations of the
+    same name — two models' defaults, say — so there the model's name
+    prefixes the configuration's, keeping every row distinct. The same rule
+    the benchmark history applies to its stored labels.
+
+    Args:
+        model: The pair's model name.
+        name: The pair's configuration name.
+        multi_model: Whether the matrix spans more than one model.
+
+    Returns:
+        str: The label the row is shown under.
+    """
+    if multi_model and model != name:
+        return f"{model} / {name}"
+
+    return name
+
+
+def _on_progress(
+    job: Job,
+    rows: dict[tuple[str, str], int] | None,
+) -> Callable[[dict], None]:
+    """Build the callback MSHCore invokes as a benchmark's steps advance.
+
+    MSHCore calls it once before every prompt and once after every finished
+    repetition, with a dict carrying which model and configuration (name and
+    position of each), which prompt and repetition, how many of both, and how
+    many steps the whole run has completed and will run in total. It carries no
+    success information: a failed repetition is indistinguishable from a
+    finished one here, so every row the callback closes is provisional and
+    ``_close_benchmark_steps`` rewrites the states from the result afterwards.
+    MSHCore already absorbs callback failures — an exception is logged and
+    dropped rather than raised into the run — so this reshaping adds no
+    guarding of its own.
+
+    Args:
+        job: Job whose rows the callback keeps current.
+        rows: (model, configuration name) to row index, for a matrix. None
+            when the rows are prompts of a single test, which the prompt
+            index addresses directly.
+
+    Returns:
+        Callable[[dict], None]: The callback to hand to MSHCore.
+    """
+    def on_progress(step: dict) -> None:
+        index = step.get("prompt_index")
+
+        if not isinstance(index, int) or index < 1:
+            return
+
+        starting = step.get("phase") == "prompt_start"
+        last_repetition = (
+            step.get("repetition") == step.get("repetition_count")
         )
 
-    _spawn(
-        job,
-        lambda: _run_benchmark(
-            job=job,
-            token=token,
-            names=list(models),
-            prompt_count=len(prompts),
-            single=False,
-            run=run,
-        ),
-        name="benchmark",
-    )
+        if rows is None:
+            if starting:
+                job.start_step(index - 1, detail="running")
+            elif last_repetition:
+                job.finish_step(index - 1, state=COMPLETED)
 
-    return job
+            # Same persistence duty as the matrix path below: the callback is
+            # the only thing moving this benchmark's rows.
+            job.publish()
+
+            return
+
+        key = (step.get("model"), step.get("configuration"))
+        row = rows.get(key)
+
+        if row is None:
+            return
+
+        job.start_step(row)
+        job.update_step(row, percent=_row_percent(step))
+
+        if not starting and last_repetition:
+            # The configuration's last repetition just finished. The row still
+            # reads completed even when prompts failed — the result settles it.
+            job.finish_step(row, state=COMPLETED)
+
+        # The rows advance from this callback alone, so persisting here is what
+        # keeps the record on disk current while the run continues — publish
+        # itself throttles to twice a second.
+        job.publish()
+
+    return on_progress
+
+
+def _row_percent(step: dict) -> float | None:
+    """Derive a comparison row's percentage from one progress step.
+
+    Args:
+        step: Progress dict MSHCore emitted.
+
+    Returns:
+        float | None: Percent complete for the step's configuration, or None
+        when the counts are missing or unusable.
+    """
+    prompt_index = step.get("prompt_index")
+    prompt_count = step.get("prompt_count")
+    repetition = step.get("repetition")
+    repetition_count = step.get("repetition_count")
+
+    if not all(
+        isinstance(value, int) and value is not None
+        for value in (prompt_index, prompt_count, repetition, repetition_count)
+    ):
+        return None
+
+    if prompt_count <= 0 or repetition_count <= 0:
+        return None
+
+    done = (prompt_index - 1) * repetition_count + repetition
+
+    return 100.0 * done / (prompt_count * repetition_count)
 
 
 def _run_benchmark(
     job: Job,
     token: CancellationToken,
-    names: list[str],
-    prompt_count: int,
     single: bool,
     run: Callable[[CancellationToken], dict],
 ) -> None:
@@ -556,43 +676,20 @@ def _run_benchmark(
     Args:
         job: Job to keep current.
         token: Cancellation token the panel's Cancel button sets.
-        names: Row names in run order — configuration or model names for a
-            comparison, which the log tail matches entries against.
-        prompt_count: Prompts every row runs.
         single: Whether the rows are prompts rather than tests.
-        run: Runs the MSHCore comparison with the given cancellation token and
+        run: Runs the MSHCore benchmark with the given cancellation token and
             returns its result. Called on this worker thread.
     """
-    stop = threading.Event()
-    reader = threading.Thread(
-        target=lambda: _tail_benchmark(
-            job=job,
-            stop=stop,
-            names=names,
-            prompt_count=prompt_count,
-            single=single,
-        ),
-        name="benchmark-log",
-        daemon=True,
-    )
-
     try:
         job.begin()
-        reader.start()
 
         result = run(token)
     except OperationCancelled as error:
-        _stop_reader(stop, reader)
         job.finish(CANCELLED, message=str(error))
         return
     except Exception as error:
-        _stop_reader(stop, reader)
         job.finish(FAILED, message="The benchmark failed.", error=str(error))
         return
-
-    # MSHCore writes the last prompt's entry just before returning, so the reader is
-    # drained before the rows are settled from the result.
-    _stop_reader(stop, reader)
 
     _close_benchmark_steps(job, result=result, single=single)
 
@@ -626,8 +723,7 @@ def _business_result(result: dict) -> dict:
     the benchmark history keeps every comparison whole.
 
     Args:
-        result: Return value of ``ollama_runner.compare_tests`` or
-            ``ollama_runner.compare_models``.
+        result: Return value of ``ollama_runner.run_benchmark``.
 
     Returns:
         dict: The measurements the model reads.
@@ -642,22 +738,6 @@ def _business_result(result: dict) -> dict:
     return result
 
 
-def _stop_reader(stop: threading.Event, reader: threading.Thread) -> None:
-    """Stop the log reader and wait for it to drain.
-
-    Draining before the rows are settled lets a late entry still land; joining
-    before the job finishes stops one landing afterwards.
-
-    Args:
-        stop: Event the reader checks.
-        reader: Thread to join.
-    """
-    stop.set()
-
-    if reader.is_alive():
-        reader.join(timeout=DRAIN_TIMEOUT)
-
-
 def _benchmark_error(result: dict) -> str | None:
     """Report the error when a benchmark produced no successful prompt.
 
@@ -665,7 +745,7 @@ def _benchmark_error(result: dict) -> str | None:
     and the failed rows carry their own errors.
 
     Args:
-        result: Return value of ``ollama_runner.compare_tests``.
+        result: Return value of ``ollama_runner.run_benchmark``.
 
     Returns:
         str | None: The first error found, or None when the run succeeded.
@@ -689,14 +769,14 @@ def _benchmark_error(result: dict) -> str | None:
 def _close_benchmark_steps(job: Job, result: dict, single: bool) -> None:
     """Settle every row from the returned result.
 
-    The rows advance from the execution log while the run is in flight, which is
-    best-effort: an entry can be written after the last read, and a prompt that
-    failed before MSHCore logged it produces no entry at all. The result is
-    authoritative, so it closes every row once the run is over.
+    The rows advance from MSHCore's progress callback while the run is in flight,
+    which is best-effort: the callback carries no success information, so a
+    closed row always reads completed. The result is authoritative, so it closes
+    every row again with its true state once the run is over.
 
     Args:
         job: Job whose rows are being closed.
-        result: Return value of ``ollama_runner.compare_tests``.
+        result: Return value of ``ollama_runner.run_benchmark``.
         single: Whether the rows are prompts rather than configurations.
     """
     tests = result.get("tests") or []
@@ -732,104 +812,6 @@ def _close_benchmark_steps(job: Job, result: dict, single: bool) -> None:
             state=FAILED if entries and failed == len(entries) else COMPLETED,
             detail=f"{len(entries)}/{len(entries)}",
         )
-
-
-def _tail_benchmark(
-    job: Job,
-    stop: threading.Event,
-    names: list[str],
-    prompt_count: int,
-    single: bool,
-) -> None:
-    """Advance a benchmark's rows from the entries MSHCore logs per prompt.
-
-    This is the only place the execution log is read, and nothing above it knows
-    that is where the figures come from. If MSHCore gains a progress callback, this
-    function is what it replaces.
-
-    Args:
-        job: Job to update.
-        stop: Set once the MSHCore call has returned.
-        names: Configuration names, in row order.
-        prompt_count: Prompts per configuration.
-        single: Whether the rows are prompts rather than configurations.
-    """
-    tail = LogTail(core_logging.get_log_file_info()["path"])
-    rows = {name: index for index, name in enumerate(names)}
-
-    try:
-        while True:
-            _drain(job, tail, rows, prompt_count, single)
-            job.publish()
-
-            if stop.is_set():
-                _drain(job, tail, rows, prompt_count, single)
-                return
-
-            time.sleep(POLL_SECONDS)
-    except Exception:  # pragma: no cover - defensive
-        # The reader only decorates the bar. Its failure must not stop the
-        # benchmark, and the worker still reaches a terminal status without it.
-        return
-
-
-def _drain(
-    job: Job,
-    tail: LogTail,
-    rows: dict[str, int],
-    prompt_count: int,
-    single: bool,
-) -> None:
-    """Apply every log entry appended since the last read.
-
-    Args:
-        job: Job to update.
-        tail: Reader for the execution log.
-        rows: Configuration name to row index.
-        prompt_count: Prompts per configuration.
-        single: Whether the rows are prompts rather than configurations.
-    """
-    for entry in tail.read_new():
-        if entry["component"] != BENCHMARK_COMPONENT:
-            continue
-
-        details = entry["details"]
-        name = details.get("name")
-        index = details.get("prompt_index")
-
-        if name not in rows or index is None:
-            continue
-
-        failed = details.get("success") is False
-        error = details.get("error")
-
-        if single:
-            job.finish_step(
-                index - 1,
-                state=FAILED if failed else COMPLETED,
-                error=error,
-            )
-
-            if index < job.step_count():
-                job.start_step(index, detail="running")
-            continue
-
-        row = rows[name]
-
-        job.start_step(row)
-        job.update_step(
-            row,
-            percent=100.0 * index / max(1, prompt_count),
-            detail=f"{index}/{prompt_count}",
-            error=error,
-        )
-
-        if index >= prompt_count:
-            job.finish_step(
-                row,
-                state=FAILED if failed else COMPLETED,
-                detail=f"{index}/{prompt_count}",
-            )
 
 
 # ============================================================

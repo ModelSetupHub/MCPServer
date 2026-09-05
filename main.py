@@ -96,9 +96,10 @@ restricted to a fixed domain whitelist.
   system_scan, which on Windows makes eight subprocess calls and can take
   tens of seconds — do not call it for a single number. system_scan reports
   memory and storage in GiB; the narrow tools report raw bytes.
-- Generate text: ollama_run_model. Measure speed: ollama_run_test. Compare
-  parameter sets: ollama_compare_tests. Compare models against each other:
-  ollama_compare_models. Only ollama_configure_model creates a
+- Generate text: ollama_run_model. Measure speed: ollama_run_test. Run a
+  benchmark matrix — one model under several configurations, several models
+  under one shared configuration, or any mix: ollama_run_benchmark. Only
+  ollama_configure_model creates a
   persistent model variant; the benchmark tools apply parameters per request
   and create nothing.
 - One file from the web: download_file, the primary download tool.
@@ -148,14 +149,14 @@ first call already returned it, and a second call starts a second operation.
 Immediate: every read-only tool, and every download_* queue-control tool.
 
 Blocking until finished, with no progress reporting: ollama_run_model,
-ollama_run_test, ollama_compare_tests, ollama_compare_models, ollama_start,
+ollama_run_test, ollama_run_benchmark, ollama_start,
 ollama_stop, ollama_install, python_run_script, python_install_packages,
 python_create_environment and python_install_python. None has a timeout,
 several take minutes, and installers have no progress variant at all.
 
 Background, returning a progress_id at once: download_file,
-download_start_with_progress, ollama_run_test_with_progress,
-ollama_compare_tests_with_progress and ollama_compare_models_with_progress.
+download_start_with_progress, ollama_run_test_with_progress and
+ollama_run_benchmark_with_progress.
 Track them with progress_get_status(progress_id), which is a fast,
 non-blocking read of a recorded snapshot: status is 'starting' or 'running'
 while work continues, then 'completed', 'failed' or 'cancelled'. It answers
@@ -183,13 +184,14 @@ The two kinds differ in what waking up means:
   failed or cancelled run produces no measurements and says so. The run
   stays in the history afterwards: a completed snapshot carries its
   'benchmark_id', and benchmark_list_history and benchmark_get_saved_result
-  reach it again in any later conversation. Every background comparison
-  also carries a 'significance' verdict — a real true/false when
-  repetitions ran above 1, null when each prompt was measured once.
+  reach it again in any later conversation. Every background comparison also
+  carries a two-way 'significance' assessment: 'by_model' judges each model's
+  configurations against each other, 'across_models' judges the models against
+  each other. A verdict's 'significant' is a real true/false when repetitions
+  ran above 1, null when each prompt was measured once.
 
-Use the synchronous ollama_run_test, ollama_compare_tests or
-ollama_compare_models when you want the measurements from a single call and
-no progress bar.
+Use the synchronous ollama_run_test or ollama_run_benchmark when you want
+the measurements from a single call and no progress bar.
 
 ## Controlling a running operation
 
@@ -872,7 +874,7 @@ def register_ollama_model_tools(server: MCPServer) -> None:
             "Create a new, separately named model from an existing one with "
             "Modelfile PARAMETER values baked in, for example temperature or "
             "num_ctx. Use this only when a persistent variant is wanted — for "
-            "trying parameters out, ollama_run_test and ollama_compare_tests "
+            "trying parameters out, ollama_run_test and ollama_run_benchmark "
             "apply them per request and create nothing. Requires the Ollama "
             "service to be running and source_model to be installed, as "
             "printed by ollama_list_models. source_model is left completely "
@@ -988,7 +990,7 @@ def register_benchmark_tools(server: MCPServer) -> None:
             "spread of the timing and rate metrics is reported alongside the "
             "means, so set it above 1 whenever a conclusion has to survive "
             "run-to-run noise. Returns one dict with exactly 'name', "
-            "'model', 'configuration', 'results' (one entry "
+            "'model', 'configuration', 'repetitions', 'results' (one entry "
             "per prompt, in order) and 'summary'. A successful prompt entry "
             "carries 'repetitions' (how many runs were averaged), "
             "'duration_seconds', 'prompt_tokens', 'output_tokens', "
@@ -1052,135 +1054,84 @@ def register_benchmark_tools(server: MCPServer) -> None:
         )
 
     @server.tool(
-        name="ollama_compare_tests",
-        title="Compare configurations",
+        name="ollama_run_benchmark",
+        title="Run a benchmark matrix",
         description=(
-            "Benchmark one model repeatedly, once per parameter "
-            "configuration, over the same prompts, and return every "
-            "configuration's measurements side by side in this one call. "
-            "Primary tool for choosing between parameter sets when you want "
-            "the numbers immediately; use ollama_compare_tests_with_progress "
-            "when a human is watching. Requires the Ollama service to be "
-            "running and model_name to be installed. Each entry in "
-            "configurations is a dict with 'name' (a label; defaults to "
-            "'configuration_N') and 'options' (the generation parameters, "
-            "defaulting to none). Parameters are applied per request; no "
-            "model is created or modified. repetitions runs every prompt "
-            "more than once per configuration and reports the run-to-run "
-            "spread with the means; set it above 1 whenever the conclusion "
-            "has to survive noise. Returns one dict with exactly 'model', "
-            "'tests' and 'significance', where 'tests' holds one "
-            "full ollama_run_test result per configuration in the order "
-            "given, and 'significance' judges the two fastest "
-            "configurations: 'leader', 'runner_up', 'difference', "
-            "'noise_level', 'difference_to_noise_ratio', 'significant' and "
-            "a 'message' explaining the verdict. With repetitions above 1 "
-            "'significant' is a real true/false answer to whether the gap "
-            "exceeds the measured noise; at the default of 1 it is null "
-            "with a message saying so — a visible gap between single "
-            "measurements is not evidence. It is advisory; also read the "
-            "per-configuration 'summary' values yourself. Total cost is the "
-            "prompt count multiplied by the configuration count times "
-            "repetitions, every one a full generation, and it blocks for "
-            "all of them with no timeout and no progress reporting. Leave "
-            "include_output false unless the "
-            "generated text is needed: true multiplies the response size by "
-            "the configuration count and can overflow the context."
+            "Benchmark a matrix of models, configurations and prompts, and "
+            "return every measurement side by side in this one call. Primary "
+            "tool for systematic comparison when you want the numbers "
+            "immediately; use ollama_run_benchmark_with_progress when a "
+            "human is watching. Requires the Ollama service to be running "
+            "and every model named to be installed; verify with "
+            "ollama_list_models first. experiments is a list of dicts, one "
+            "per model in run order: 'model' (required) is the model name "
+            "or tag, and 'configurations' (optional) a list of dicts, each "
+            "with 'name' (a label; defaults to 'configuration_N'), "
+            "'options' (the generation parameters, defaulting to none) and "
+            "an optional 'prompts' list only that configuration answers. "
+            "Every configuration answers shared_prompts before its own; a "
+            "model with no configurations runs once under its defaults. "
+            "Two shapes cover most needs: one model carrying several "
+            "configurations compares parameter sets, and several models "
+            "under one shared configuration compare models — a fair "
+            "comparison changes one thing at a time. Models run one after "
+            "another — the model measured before is unloaded before the "
+            "next loads, so timings never compete for VRAM; a model that "
+            "was already loaded before the benchmark began is not the "
+            "benchmark's to stop and stays loaded. Parameters are applied "
+            "per request; no model is created or modified. repetitions "
+            "runs every prompt more than once per configuration and "
+            "reports the run-to-run spread with the means; set it above 1 "
+            "whenever the conclusion has to survive noise. Returns one "
+            "dict with exactly 'experiments' (the normalized matrix that "
+            "ran), 'models' (the names, in run order), 'tests' (one full "
+            "ollama_run_test result per model-configuration pair, in run "
+            "order, its 'name' being the configuration's label) and "
+            "'significance', which judges the matrix both ways it can: "
+            "'by_model' maps each model's name to the verdict on its own "
+            "configurations, and 'across_models' judges the models, each "
+            "represented by its fastest configuration — each verdict "
+            "carrying 'leader', 'runner_up', 'difference', 'noise_level', "
+            "'difference_to_noise_ratio', 'significant' and a 'message' "
+            "explaining it. With repetitions above 1 'significant' is a "
+            "real true/false answer to whether the gap exceeds the "
+            "measured noise; at the default of 1 it is null with a message "
+            "saying so — a visible gap between single measurements is not "
+            "evidence. It is advisory; also read the per-test 'summary' "
+            "values yourself. Total cost is every pair's prompt count "
+            "multiplied by repetitions, every one a full generation, and "
+            "it blocks for all of them with no timeout and no progress "
+            "reporting. Leave include_output false unless the generated "
+            "text is needed: true adds every full completion to the "
+            "response and can overflow the context."
         ),
         annotations=benchmark,
     )
     @surface_core_errors
-    def ollama_compare_tests(
-        model_name: str,
-        prompts: list[str],
-        configurations: list[dict],
+    def ollama_run_benchmark(
+        experiments: list[dict],
+        shared_prompts: list[str] | None = None,
         include_output: bool = False,
         repetitions: int = 1,
     ) -> dict:
-        """Compare a model across multiple configurations.
+        """Benchmark a matrix of models, configurations and prompts.
 
         Args:
-            model_name: Model name or tag to benchmark.
-            prompts: Prompts run against every configuration.
-            configurations: Configurations to compare, each shaped as
-                {"name": "warm", "options": {"temperature": 0.9}}.
+            experiments: One dict per model, shaped as
+                {"model": "llama3", "configurations": [{"name": "warm",
+                "options": {"temperature": 0.9}}]}.
+            shared_prompts: Prompts every configuration answers.
             include_output: Whether to include generated text alongside metrics.
             repetitions: How many times every prompt runs per configuration,
                 from 1.
 
         Returns:
-            dict: One benchmark result per configuration.
+            dict: One benchmark result per model-configuration pair and the
+                significance assessments over them.
         """
-        return ollama_runner.compare_tests(
-            model=model_name,
-            prompts=prompts,
-            configurations=configurations,
-            include_output=include_output,
-            repetitions=repetitions,
-        )
-
-    @server.tool(
-        name="ollama_compare_models",
-        title="Compare models",
-        description=(
-            "Benchmark several models over the same prompts under one "
-            "shared configuration, and return every model's measurements "
-            "side by side in this one call. Primary tool for choosing "
-            "between models when you want the numbers immediately; use "
-            "ollama_compare_models_with_progress when a human is watching — "
-            "that is the background variant of this tool, and the only "
-            "cross-model comparison with a progress bar. Requires the "
-            "Ollama service to be running and every name in model_names to "
-            "be installed; verify with ollama_list_models first. Models run "
-            "one after another — the model measured before is unloaded "
-            "before the next loads, so timings never compete for VRAM; a "
-            "model that was already loaded before the comparison began is "
-            "not the comparison's to stop and stays loaded. config is one "
-            "generation-options dict shared by every model, because a fair "
-            "comparison changes one thing at a time; several configurations "
-            "per model means ollama_compare_tests instead. repetitions runs "
-            "every prompt more than once per model and reports the "
-            "run-to-run spread with the means; set it above 1 whenever the "
-            "conclusion has to survive noise. Returns one dict with exactly "
-            "'models' (the names, in run order), 'tests' (one full "
-            "ollama_run_test result per model, its 'name' being the model's "
-            "own) and 'significance' judging the two fastest models — "
-            "'significant' is a real true/false verdict with repetitions "
-            "above 1 and null at the default of 1. Read the winner from "
-            "each test's 'summary'. Total cost is the prompt count "
-            "multiplied by the model count times repetitions, every one a "
-            "full generation, and it blocks for all of them with no timeout "
-            "and no progress reporting. Leave include_output false unless "
-            "the generated text is needed: true multiplies the response "
-            "size by the model count and can overflow the context."
-        ),
-        annotations=benchmark,
-    )
-    @surface_core_errors
-    def ollama_compare_models(
-        model_names: list[str],
-        prompts: list[str],
-        config: dict | None = None,
-        include_output: bool = False,
-        repetitions: int = 1,
-    ) -> dict:
-        """Compare several models over the same prompts.
-
-        Args:
-            model_names: Models to benchmark, in run order.
-            prompts: Prompts every model answers.
-            config: Optional generation options shared by every model.
-            include_output: Whether to include generated text alongside metrics.
-            repetitions: How many times every prompt runs per model, from 1.
-
-        Returns:
-            dict: One benchmark result per model and a significance
-                assessment.
-        """
-        return ollama_runner.compare_models(
-            models=model_names,
-            prompts=prompts,
-            config=config,
+        return ollama_runner.run_benchmark(
+            experiments=experiments,
+            shared_prompts=shared_prompts,
             include_output=include_output,
             repetitions=repetitions,
         )
@@ -1190,9 +1141,9 @@ def register_benchmark_tools(server: MCPServer) -> None:
         title="List saved benchmark runs",
         description=(
             "List every benchmark run kept in the history, newest first. "
-            "Every completed background benchmark — ollama_run_test_with_progress, "
-            "ollama_compare_tests_with_progress, "
-            "ollama_compare_models_with_progress — is saved here "
+            "Every completed background benchmark — "
+            "ollama_run_test_with_progress and "
+            "ollama_run_benchmark_with_progress — is saved here "
             "automatically, as is nothing else: the synchronous benchmark "
             "tools return their measurements in the call and store nothing. "
             "Read-only and cheap: the listing comes from a small index file, "
@@ -1204,7 +1155,9 @@ def register_benchmark_tools(server: MCPServer) -> None:
             "benchmark_delete_history take), 'saved_at', 'model' or "
             "'models', 'repetitions', "
             "'configuration_count', 'prompt_count', 'winner' (the fastest "
-            "configuration or model's name) and 'significant'. The history "
+            "pair's label — the configuration's name, prefixed with the "
+            "model's name once several models ran) and 'significant'. The "
+            "history "
             "keeps the most recent runs only, so old ids disappear as new "
             "runs arrive."
         ),

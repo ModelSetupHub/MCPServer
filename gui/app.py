@@ -193,7 +193,7 @@ def register_progress_tools(server: Any) -> None:
         title="Get a finished benchmark's measurements",
         description=(
             "Retrieve the measurements produced by a benchmark started with "
-            "ollama_run_test_with_progress or ollama_compare_tests_with_progress, "
+            "ollama_run_test_with_progress or ollama_run_benchmark_with_progress, "
             "by its progress_id. This is where a benchmark's actual results come "
             "from: the starting tool returns only a handle, and progress_get_status "
             "reports only progress. Call this once progress_get_status reports "
@@ -201,7 +201,7 @@ def register_progress_tools(server: Any) -> None:
             "the benchmark is still running, and for a failed or cancelled run it "
             "reports that there are no measurements. Returns the same per-prompt "
             "timings, token counts and averaged summary the synchronous "
-            "ollama_run_test and ollama_compare_tests return."
+            "ollama_run_test and ollama_run_benchmark return."
         ),
         annotations=ToolAnnotations(
             read_only_hint=True,
@@ -727,10 +727,9 @@ def _register_benchmarks(apps: Apps) -> None:
             "id to obtain the measurements. "
             "The benchmark is not finished, and its results cannot be reported, "
             "until that retrieval. repetitions runs every prompt more than once "
-            "and reports the run-to-run spread with the means, which is also "
-            "what turns the comparison verdicts on; each repetition is a full "
-            "generation, so the run costs prompts x repetitions generations. "
-            "Prefer this whenever a human is watching, since "
+            "and reports the run-to-run spread with the means; each repetition is "
+            "a full generation, so the run costs prompts x repetitions "
+            "generations. Prefer this whenever a human is watching, since "
             "each prompt is a full generation; use the synchronous ollama_run_test "
             "when the measurements are wanted in one call and no progress bar is "
             "needed."
@@ -761,9 +760,15 @@ def _register_benchmarks(apps: Apps) -> None:
             dict: The ``progress_id`` to poll, and the contract to follow.
         """
         job = workers.start_benchmark(
-            model=model_name,
-            prompts=prompts,
-            configurations=[{"name": name, "options": dict(config or {})}],
+            experiments=[
+                {
+                    "model": model_name,
+                    "configurations": [
+                        {"name": name, "options": dict(config or {})}
+                    ],
+                }
+            ],
+            shared_prompts=prompts,
             include_output=include_output,
             repetitions=repetitions,
         )
@@ -772,45 +777,53 @@ def _register_benchmarks(apps: Apps) -> None:
 
     @apps.tool(
         resource_uri=PROGRESS_URI,
-        name="ollama_compare_tests_with_progress",
-        title="Start comparing configurations, with a progress bar",
+        name="ollama_run_benchmark_with_progress",
+        title="Start a benchmark matrix, with a progress bar",
         description=(
-            "Start a comparison of one model under several sets of generation "
-            "parameters, running it in the background and showing a live progress "
-            "bar in the conversation with one row per configuration. Returns "
-            "immediately with a progress_id — an acknowledgement that the "
-            "comparison has started, NOT its results, which do not exist yet. Say "
-            "that it has started, end the turn and go to sleep; when the user "
-            "calls again, poll progress_get_status with that id until the status "
-            "is 'completed', 'failed' or 'cancelled', then call "
-            "benchmark_get_result with the same id to obtain the side-by-side "
-            "measurements. The comparison is not "
-            "finished, and no configuration can be recommended, until that "
-            "retrieval. repetitions runs every prompt more than once per "
-            "configuration and reports the run-to-run spread, which is also "
-            "what turns the 'significance' verdict on. Total time is the prompt "
-            "count multiplied by the configuration count, which is why this "
-            "runs asynchronously; use the "
-            "synchronous ollama_compare_tests when the measurements are wanted in "
-            "one call."
+            "Start a benchmark matrix of models, configurations and prompts, "
+            "running it in the background and showing a live progress bar in the "
+            "conversation with one row per model-configuration pair. experiments "
+            "is a list of dicts, one per model in run order: 'model' (required) "
+            "and 'configurations' (optional; each a dict with 'name', 'options' "
+            "and an optional 'prompts' list only that configuration answers). "
+            "Every configuration answers shared_prompts before its own; a model "
+            "with no configurations runs once under its defaults. One model "
+            "carrying several configurations compares parameter sets; several "
+            "models under one shared configuration compare models. Models run "
+            "one after another — each is unloaded before the next loads, so "
+            "timings never compete for VRAM. Returns immediately with a "
+            "progress_id — an acknowledgement that the benchmark has started, "
+            "NOT its results, which do not exist yet. Say that it has started, "
+            "end the turn and go to sleep; when the user calls again, poll "
+            "progress_get_status with that id until the status is 'completed', "
+            "'failed' or 'cancelled', then call benchmark_get_result with the "
+            "same id to obtain the side-by-side measurements and the two-way "
+            "'significance' assessment ('by_model' and 'across_models'). "
+            "repetitions runs every prompt more than once per configuration and "
+            "reports the run-to-run spread, which is also what turns the "
+            "significance verdicts on. Total time is every pair's prompt count "
+            "multiplied by repetitions, which is why this runs asynchronously; "
+            "use the synchronous ollama_run_benchmark when the measurements are "
+            "wanted in one call. Verify every model with ollama_list_models "
+            "first, and prefer the smallest prompt list that can tell the "
+            "subjects apart."
         ),
         annotations=LONG_RUNNING,
     )
     @surface_core_errors
-    def ollama_compare_tests_with_progress(
-        model_name: str,
-        prompts: list[str],
-        configurations: list[dict],
+    def ollama_run_benchmark_with_progress(
+        experiments: list[dict],
+        shared_prompts: list[str] | None = None,
         include_output: bool = False,
         repetitions: int = 1,
     ) -> dict:
-        """Start a comparison across configurations.
+        """Start a benchmark across a matrix of models and configurations.
 
         Args:
-            model_name: Model name or tag to benchmark.
-            prompts: Prompts run against every configuration.
-            configurations: Configurations to compare, each shaped as
-                {"name": "warm", "options": {"temperature": 0.9}}.
+            experiments: One dict per model, shaped as
+                {"model": "llama3", "configurations": [{"name": "warm",
+                "options": {"temperature": 0.9}}]}.
+            shared_prompts: Prompts every configuration answers.
             include_output: Whether to keep generated text alongside metrics.
             repetitions: How many times every prompt runs per configuration,
                 from 1.
@@ -819,128 +832,117 @@ def _register_benchmarks(apps: Apps) -> None:
             dict: The ``progress_id`` to poll, and the contract to follow.
 
         Raises:
-            ToolError: If no configuration was given, or one is malformed. Checked
-                here because the worker runs after this returns, so a bad argument
-                would otherwise surface only on the progress bar.
+            ToolError: If no experiment was given, or one is malformed, or
+                the matrix names no prompts at all. Checked here because the
+                worker runs after this returns, so a bad argument would
+                otherwise surface only on the progress bar.
         """
+        experiments = _normalise_experiments(experiments, shared_prompts)
+
         job = workers.start_benchmark(
-            model=model_name,
-            prompts=prompts,
-            configurations=_normalise(configurations),
+            experiments=experiments,
+            shared_prompts=shared_prompts,
             include_output=include_output,
             repetitions=repetitions,
         )
 
         return _benchmark_started(
             job,
-            model=model_name,
-            configurations=len(configurations),
-        )
-
-    @apps.tool(
-        resource_uri=PROGRESS_URI,
-        name="ollama_compare_models_with_progress",
-        title="Start comparing models, with a progress bar",
-        description=(
-            "Start a cross-model comparison: the same prompts and one shared "
-            "configuration run against several models, one after another, with "
-            "each model unloaded before the next loads so timings never compete "
-            "for VRAM. Shows a live progress bar with one row per model. Returns "
-            "immediately with a progress_id — an acknowledgement that the "
-            "comparison has started, NOT its results. Say that it has started, "
-            "end the turn and go to sleep; when the user calls again, poll "
-            "progress_get_status with that id until the status is 'completed', "
-            "'failed' or 'cancelled', then call benchmark_get_result with the "
-            "same id to obtain the side-by-side measurements and the "
-            "'significance' verdict on the two fastest models. Verify every "
-            "model with ollama_list_models first, and prefer the smallest "
-            "prompt list that can tell the models apart — total time is the "
-            "prompt count multiplied by the model count. There is no "
-            "synchronous variant; this is the only cross-model comparison tool."
-        ),
-        annotations=LONG_RUNNING,
-    )
-    @surface_core_errors
-    def ollama_compare_models_with_progress(
-        model_names: list[str],
-        prompts: list[str],
-        config: dict | None = None,
-        include_output: bool = False,
-        repetitions: int = 1,
-    ) -> dict:
-        """Start a comparison across models.
-
-        Args:
-            model_names: Model names or tags, in run order.
-            prompts: Prompts every model answers.
-            config: Optional generation options shared by every model.
-            include_output: Whether to keep generated text alongside metrics.
-            repetitions: How many times every prompt runs per model, from 1.
-
-        Returns:
-            dict: The ``progress_id`` to poll, and the contract to follow.
-
-        Raises:
-            ToolError: If fewer than two models were named. A comparison of one
-                model against itself is not a comparison; the worker would
-                surface the error only after this returned.
-        """
-        if len(model_names) < 2:
-            raise ToolError(
-                "At least two models are required for a comparison; to "
-                "benchmark one model use ollama_run_test_with_progress."
-            )
-
-        job = workers.start_model_comparison(
-            models=model_names,
-            prompts=prompts,
-            config=config,
-            include_output=include_output,
-            repetitions=repetitions,
-        )
-
-        return _benchmark_started(
-            job,
-            models=model_names,
-            prompts=len(prompts),
+            models=sorted({experiment["model"] for experiment in experiments}),
+            configurations=sum(
+                len(experiment["configurations"])
+                for experiment in experiments
+            ),
         )
 
 
-def _normalise(configurations: list[dict]) -> list[dict]:
-    """Validate and name the configurations before the worker starts.
+def _normalise_experiments(
+    experiments: list[dict],
+    shared_prompts: list[str] | None,
+) -> list[dict]:
+    """Validate the matrix before the worker starts.
 
-    MSHCore normalises these itself, but it does so on the worker thread — after the
-    tool has returned. Doing it here means a malformed configuration is a tool
-    error the model can act on, and the row names are known before MSHCore runs.
+    MSHCore normalises and validates these itself, but it does so on the worker
+    thread — after the tool has returned. Doing it here means a malformed
+    experiment is a tool error the model can act on, and a matrix that names
+    no prompts fails now rather than as a failed progress bar.
 
     Args:
-        configurations: Configurations as given to the tool.
+        experiments: Experiments as given to the tool.
+        shared_prompts: Prompts every configuration answers, for checking
+            that each configuration ends up with work to do.
 
     Returns:
-        list[dict]: One ``{"name", "options"}`` per configuration.
+        list[dict]: The experiments as given, verified.
 
     Raises:
         ToolError: If the list is empty or an entry is not usable.
     """
-    if not configurations:
-        raise ToolError("At least one configuration is required.")
+    if not isinstance(experiments, list) or not experiments:
+        raise ToolError("At least one experiment is required.")
 
-    normalised = []
+    if shared_prompts is not None and (
+        not isinstance(shared_prompts, list)
+        or not all(isinstance(prompt, str) for prompt in shared_prompts)
+    ):
+        raise ToolError("shared_prompts must be a list of strings.")
 
-    for position, configuration in enumerate(configurations, start=1):
-        if not isinstance(configuration, dict):
-            raise ToolError(f"Configuration {position} must be an object.")
+    for position, experiment in enumerate(experiments, start=1):
+        if not isinstance(experiment, dict):
+            raise ToolError(f"Experiment {position} must be an object.")
 
-        options = configuration.get("options", {})
+        model = experiment.get("model")
 
-        if not isinstance(options, dict):
-            raise ToolError(f"Configuration {position} options must be an object.")
+        if not isinstance(model, str) or not model.strip():
+            raise ToolError(f"Experiment {position} must name a model.")
 
-        normalised.append(
-            {
-                "name": str(configuration.get("name") or f"configuration_{position}"),
-                "options": options,
-            }
-        )
+        configurations = experiment.get("configurations")
 
-    return normalised
+        if configurations is None:
+            if not shared_prompts:
+                raise ToolError(
+                    f"Experiment '{model}' has nothing to run: give "
+                    f"shared_prompts, or configurations with 'prompts' of "
+                    f"their own."
+                )
+
+            continue
+
+        if not isinstance(configurations, list) or not configurations:
+            raise ToolError(
+                f"Experiment '{model}' must carry a non-empty configurations "
+                f"list, or none at all."
+            )
+
+        for index, configuration in enumerate(configurations, start=1):
+            if not isinstance(configuration, dict):
+                raise ToolError(
+                    f"Configuration {index} of '{model}' must be an object."
+                )
+
+            options = configuration.get("options", {})
+
+            if not isinstance(options, dict):
+                raise ToolError(
+                    f"Configuration {index} of '{model}' options must be an "
+                    f"object."
+                )
+
+            prompts = configuration.get("prompts")
+
+            if prompts is not None and (
+                not isinstance(prompts, list)
+                or not all(isinstance(prompt, str) for prompt in prompts)
+            ):
+                raise ToolError(
+                    f"Configuration {index} of '{model}' prompts must be a "
+                    f"list of strings."
+                )
+
+            if not prompts and not shared_prompts:
+                raise ToolError(
+                    f"Configuration {index} of '{model}' has nothing to run: "
+                    f"give shared_prompts, or a 'prompts' list of its own."
+                )
+
+    return experiments

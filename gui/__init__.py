@@ -8,9 +8,9 @@ Everything to do with the in-chat progress panel, kept out of ``main.py``:
 - ``jobs`` — the ``Job`` model, the registry of jobs running now, and the
   persistence that keeps every job's snapshot on disk and its benchmark result
   in the benchmark history.
-- ``workers`` — the threads that run the operations and keep their jobs current.
-- ``logtail`` — incremental reader for the execution log, used only by the
-  benchmark worker.
+- ``workers`` — the threads that run the operations and keep their jobs current,
+  fed by MSHCore's own progress reporting: the download manager's status for
+  downloads, the benchmark runner's ``on_progress`` callback for benchmarks.
 - ``app`` — the Apps extension: the ``ui://`` resource plus the tools bound to it,
   and ``register_progress_tools`` for the plain tools the model polls with.
 
@@ -40,7 +40,6 @@ from .workers import (
     note_download_ended,
     start_benchmark,
     start_download,
-    start_model_comparison,
 )
 
 __all__ = [
@@ -50,5 +49,4 @@ __all__ = [
     "note_download_ended",
     "start_benchmark",
     "start_download",
-    "start_model_comparison",
 ]

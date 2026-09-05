@@ -175,8 +175,8 @@ def save_job_result(result: dict) -> str | None:
     terminal status inside the store.
 
     Args:
-        result: A comparison result carrying ``model`` and ``tests``, as
-            ``ollama_runner.compare_tests`` returned it.
+        result: A comparison result carrying ``tests`` and a ``models`` list,
+            as ``ollama_runner.run_benchmark`` returned it.
 
     Returns:
         str | None: The identifier the history entry was stored under, or None
