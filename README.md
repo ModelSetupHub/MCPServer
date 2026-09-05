@@ -27,7 +27,7 @@ library, so they can be used interchangeably on the same machine.
 
 ## What the agent can do
 
-65 tools in total. Almost all of them are direct pass-throughs to the toolkit, so the agent gets the same capabilities a
+56 tools in total. All of them are direct pass-throughs to the toolkit, so the agent gets the same capabilities a
 script would, grouped by area:
 
 - **System** — scan the machine, or read just the memory, storage, GPU or CUDA details.

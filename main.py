@@ -150,8 +150,9 @@ Immediate: every read-only tool, and every download_* queue-control tool.
 Blocking until finished, with no progress reporting: ollama_run_model,
 ollama_start, ollama_stop, ollama_install, python_run_script,
 python_install_packages, python_create_environment and python_install_python.
-None has a timeout, several take minutes, and installers have no progress
-variant at all.
+Only ollama_start and ollama_stop take a timeout argument (15 and 10 seconds
+by default); the rest have none, several take minutes, and installers have no
+progress variant at all.
 
 Background, returning a progress_id at once: download_file, download_start
 and ollama_run_benchmark.
@@ -290,8 +291,8 @@ def register_system_tools(server: MCPServer) -> None:
             "use it only when several categories are needed at once, and "
             "prefer system_get_gpu_info, system_get_storage_info, "
             "system_get_memory_info or system_get_cuda_version for a single "
-            "metric. No prerequisites. Read-only; writes one execution-log "
-            "entry and changes nothing else. Shells out eight times on "
+            "metric. No prerequisites. Read-only; writes its execution-log "
+            "entries and changes nothing else. Shells out eight times on "
             "Windows (six PowerShell queries, two nvidia-smi), each with its "
             "own five-second timeout, so it can block for tens of seconds. "
             "Returns one dict with exactly these keys: 'system' (OS name, "
@@ -879,10 +880,12 @@ def register_ollama_model_tools(server: MCPServer) -> None:
             "verify it is free first. Each variant is a new entry in Ollama's "
             "store, so repeated calls accumulate models — remove them with "
             "ollama_remove_model. parameters is a flat dict of PARAMETER "
-            "key-values; entries whose value is null are dropped, and an "
-            "invalid key or value is only detected by Ollama. Blocks until "
-            "Ollama finishes creating the variant. Returns the raw text "
-            "'ollama create' prints."
+            "key-values, for example {'temperature': 0.7, 'num_ctx': 4096}; "
+            "entries whose value is null are dropped, and at least one must "
+            "survive — an empty dict, or one whose every value is null, "
+            "fails. An invalid key or value is only detected by Ollama. "
+            "Blocks until Ollama finishes creating the variant. Returns the "
+            "raw text 'ollama create' prints."
         ),
         annotations=ToolAnnotations(
             read_only_hint=False,
@@ -1245,9 +1248,10 @@ def register_python_tools(server: MCPServer) -> None:
             "as returned by python_create_environment; omitting it installs "
             "into the interpreter running this server, which mutates the "
             "environment this server itself depends on — prefer an explicit "
-            "environment. packages is a list of requirement strings, each "
-            "optionally pinned, for example 'numpy==1.26.4'; pin versions "
-            "when reproducibility matters. Reaches the network and downloads "
+            "environment. packages is a non-empty list of requirement "
+            "strings, each optionally pinned, for example 'numpy==1.26.4'; "
+            "pin versions when reproducibility matters, and an empty list "
+            "fails. Reaches the network and downloads "
             "from the configured package index, and installing a package can "
             "upgrade or downgrade its dependencies in place. Blocks until pip "
             "exits, with no timeout and no progress reporting, which for "
@@ -1290,7 +1294,9 @@ def register_python_tools(server: MCPServer) -> None:
             "unconfirmed: pip runs with -y, so there is no prompt, and a "
             "package's dependents are left broken rather than removed. "
             "Confirm the exact names with python_list_packages first. "
-            "env_path is a virtual environment directory as returned by "
+            "packages is the list of package names to remove; at least one "
+            "is required. env_path is a virtual environment directory as "
+            "returned by "
             "python_create_environment; omitting it targets the interpreter "
             "running this server, and removing a package there can break this "
             "server itself — always pass an environment unless the intent is "
@@ -1698,13 +1704,18 @@ def register_download_tools(server: MCPServer) -> None:
             "download_list_allowed_domains. destination_directory defaults to "
             "%LOCALAPPDATA%\\MSH\\downloads and is created with its parents if "
             "missing; a relative path resolves against this server's working "
-            "directory. Returns immediately with a ticket "
-            "carrying 'download_id' (a progress_id — pass it only to "
+            "directory. filename overrides the name taken from the URL, with "
+            "any directory part of it stripped; max_retries is the total "
+            "attempts per file, 3 by default. Returns immediately with a "
+            "ticket carrying 'download_id' (a progress_id — pass it only to "
             "progress_get_status, progress_pause or progress_cancel), "
-            "'session_id' (pass it only to the download_* queue tools if the "
-            "transfer needs pausing or cancelling through them), "
-            "'destination' and 'status'. Those two identifiers are not "
-            "interchangeable. Never overwrites: "
+            "'session_id' (generated, shaped 'auto-<8 hex>'; pass it only to "
+            "the download_* queue tools if the transfer needs pausing, "
+            "skipping or cancelling through them), 'destination' (the full "
+            "path the file is being written to, under the name actually "
+            "reserved), 'status' (always 'running' in this response) and "
+            "'next_step' (a ready-made hint naming both identifiers). Those "
+            "two identifiers are not interchangeable. Never overwrites: "
             "when the destination name is already taken the file is saved "
             "under a numbered variant, and 'destination' reports the name "
             "actually used. A rejected domain or an unusable directory fails "
@@ -2081,7 +2092,8 @@ def register_download_tools(server: MCPServer) -> None:
             "session's files removed. Returns immediately with the session's "
             "status; the skip takes effect at the next chunk boundary. "
             "Calling it between files, when nothing is transferring, applies "
-            "the skip to the next file instead."
+            "the skip to the next file instead — that file is fetched in "
+            "full first and only then marked skipped."
         ),
         annotations=ToolAnnotations(
             read_only_hint=False,
