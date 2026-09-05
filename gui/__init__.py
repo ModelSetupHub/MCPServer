@@ -22,7 +22,7 @@ The shape of the system:
                       the result
     the model       → polls the plain progress_get_status with the same id
 
-Only the three tools that start an operation are bound to the panel, because a
+Only the two tools that start an operation are bound to the panel, because a
 client renders one panel per tool result: binding the poll would draw a second bar
 for every poll of the first.
 

@@ -7,7 +7,7 @@ resource the client renders inline in the conversation, in a sandboxed iframe.
 That binding is what draws a progress bar, so it decides which tools may have it.
 A tool bound to the panel gets a new panel every time the *model* calls it, since
 each call is a new tool result in the conversation for the host to render. So only
-the three tools that start an operation are bound to it — one call, one job, one
+the two tools that start an operation are bound to it — one call, one job, one
 bar — and everything that merely *reads* or *controls* an existing job is a plain
 tool, registered by :func:`register_progress_tools`, with no UI of its own.
 
@@ -98,7 +98,6 @@ def create_progress_app(
     panel's own app-visible ones. Reading and controlling a job that already exists
     is registered separately by :func:`register_progress_tools`, so the model can
     poll a benchmark without every poll rendering another progress bar.
-
     Args:
         get_session: Resolver for a download session id, supplied by the layer
             that owns the session registry — ``main.py`` — so this module does not
@@ -193,15 +192,15 @@ def register_progress_tools(server: Any) -> None:
         title="Get a finished benchmark's measurements",
         description=(
             "Retrieve the measurements produced by a benchmark started with "
-            "ollama_run_test_with_progress or ollama_run_benchmark_with_progress, "
+            "ollama_run_benchmark, "
             "by its progress_id. This is where a benchmark's actual results come "
             "from: the starting tool returns only a handle, and progress_get_status "
             "reports only progress. Call this once progress_get_status reports "
             "status='completed' and result_available=true — earlier it reports that "
             "the benchmark is still running, and for a failed or cancelled run it "
             "reports that there are no measurements. Returns the same per-prompt "
-            "timings, token counts and averaged summary the synchronous "
-            "ollama_run_test and ollama_run_benchmark return."
+            "timings, token counts and averaged summary the run itself produced, "
+            "with one entry per model-configuration pair."
         ),
         annotations=ToolAnnotations(
             read_only_hint=True,
@@ -360,7 +359,7 @@ def read_result(progress_id: str) -> dict:
         }
 
     # The history stores every run as a comparison; a single test is unwrapped
-    # to the shape its synchronous tool returns, here rather than at write time.
+    # to that test's own measurements, here rather than at write time.
     result = workers._business_result(result)
 
     return {
@@ -650,23 +649,26 @@ def _register_download(apps: Apps, get_session: Callable[[str], Any]) -> None:
 
     @apps.tool(
         resource_uri=PROGRESS_URI,
-        name="download_start_with_progress",
-        title="Start downloading with a progress bar",
+        name="download_start",
+        title="Start downloading",
         description=(
-            "Start processing a session's queue and show a live progress bar in the "
-            "conversation: per-file bars with transferred and total bytes and an "
-            "overall percentage. Returns immediately with a progress_id, and the "
-            "transfer continues in the background — starting it is the whole of this "
-            "tool's job, so there is no result to collect afterwards. Carry on with "
-            "other work and call progress_get_status with the id whenever the "
-            "outcome matters, or to confirm the files arrived. Queue every file "
-            "first, and prefer this over download_start whenever a human is "
-            "watching."
+            "STEP 3 of 3: begin transferring a session's queue and show a live "
+            "progress bar in the conversation: per-file bars with transferred and "
+            "total bytes and an overall percentage. Requires download_create_session "
+            "and at least one download_add or download_add_many first, and fails "
+            "when the queue is empty; session_id is that session's name, never a "
+            "progress_id. Returns immediately with a progress_id, and the transfer "
+            "continues in the background — starting it is the whole of this tool's "
+            "job, so there is no result to collect afterwards. Carry on with other "
+            "work and call progress_get_status with the id whenever the outcome "
+            "matters, or to confirm the files arrived. Does nothing when the "
+            "session is already running. Restarting a session retries files that "
+            "failed and leaves completed, skipped and cancelled ones alone."
         ),
         annotations=LONG_RUNNING,
     )
     @surface_core_errors
-    def download_start_with_progress(session_id: str) -> dict:
+    def download_start(session_id: str) -> dict:
         """Start a session's queue with a progress bar.
 
         Args:
@@ -705,113 +707,51 @@ def _register_download(apps: Apps, get_session: Callable[[str], Any]) -> None:
 
 
 def _register_benchmarks(apps: Apps) -> None:
-    """Register the benchmarking tools bound to the panel.
+    """Register the benchmark tool bound to the panel.
 
     Args:
-        apps: Extension the tools are added to.
+        apps: Extension the tool is added to.
     """
 
     @apps.tool(
         resource_uri=PROGRESS_URI,
-        name="ollama_run_test_with_progress",
-        title="Start benchmarking one configuration, with a progress bar",
+        name="ollama_run_benchmark",
+        title="Run a benchmark matrix",
         description=(
-            "Start a benchmark of one model under one set of generation parameters, "
-            "running it in the background and showing a live progress bar in the "
-            "conversation with one row per prompt. Returns immediately with a "
-            "progress_id — an acknowledgement that the benchmark has started, NOT "
-            "its results, which do not exist yet. Say that it has started, end the "
-            "turn and go to sleep; when the user calls again, poll "
-            "progress_get_status with that id until the status is 'completed', "
-            "'failed' or 'cancelled', then call benchmark_get_result with the same "
-            "id to obtain the measurements. "
-            "The benchmark is not finished, and its results cannot be reported, "
-            "until that retrieval. repetitions runs every prompt more than once "
-            "and reports the run-to-run spread with the means; each repetition is "
-            "a full generation, so the run costs prompts x repetitions "
-            "generations. Prefer this whenever a human is watching, since "
-            "each prompt is a full generation; use the synchronous ollama_run_test "
-            "when the measurements are wanted in one call and no progress bar is "
-            "needed."
-        ),
-        annotations=LONG_RUNNING,
-    )
-    @surface_core_errors
-    def ollama_run_test_with_progress(
-        model_name: str,
-        prompts: list[str],
-        config: dict | None = None,
-        name: str = "test",
-        include_output: bool = False,
-        repetitions: int = 1,
-    ) -> dict:
-        """Start a benchmark of one configuration.
-
-        Args:
-            model_name: Model name or tag to benchmark.
-            prompts: Prompts to run, in order.
-            config: Optional generation options, for example
-                {"temperature": 0.7, "num_ctx": 4096}.
-            name: Label recorded with the results.
-            include_output: Whether to keep generated text alongside metrics.
-            repetitions: How many times every prompt runs, from 1.
-
-        Returns:
-            dict: The ``progress_id`` to poll, and the contract to follow.
-        """
-        job = workers.start_benchmark(
-            experiments=[
-                {
-                    "model": model_name,
-                    "configurations": [
-                        {"name": name, "options": dict(config or {})}
-                    ],
-                }
-            ],
-            shared_prompts=prompts,
-            include_output=include_output,
-            repetitions=repetitions,
-        )
-
-        return _benchmark_started(job, model=model_name, prompts=len(prompts))
-
-    @apps.tool(
-        resource_uri=PROGRESS_URI,
-        name="ollama_run_benchmark_with_progress",
-        title="Start a benchmark matrix, with a progress bar",
-        description=(
-            "Start a benchmark matrix of models, configurations and prompts, "
-            "running it in the background and showing a live progress bar in the "
-            "conversation with one row per model-configuration pair. experiments "
-            "is a list of dicts, one per model in run order: 'model' (required) "
-            "and 'configurations' (optional; each a dict with 'name', 'options' "
+            "Benchmark a matrix of models, configurations and prompts — the "
+            "one benchmark tool, covering everything from a single model "
+            "under one configuration to a full cross-model comparison — "
+            "running it in the background and showing a live progress bar in "
+            "the conversation with one row per model-configuration pair (one "
+            "row per prompt for the single pair). experiments is a list of "
+            "dicts, one per model in run order: 'model' (required) and "
+            "'configurations' (optional; each a dict with 'name', 'options' "
             "and an optional 'prompts' list only that configuration answers). "
-            "Every configuration answers shared_prompts before its own; a model "
-            "with no configurations runs once under its defaults. One model "
-            "carrying several configurations compares parameter sets; several "
-            "models under one shared configuration compare models. Models run "
-            "one after another — each is unloaded before the next loads, so "
-            "timings never compete for VRAM. Returns immediately with a "
-            "progress_id — an acknowledgement that the benchmark has started, "
-            "NOT its results, which do not exist yet. Say that it has started, "
-            "end the turn and go to sleep; when the user calls again, poll "
-            "progress_get_status with that id until the status is 'completed', "
-            "'failed' or 'cancelled', then call benchmark_get_result with the "
-            "same id to obtain the side-by-side measurements and the two-way "
-            "'significance' assessment ('by_model' and 'across_models'). "
-            "repetitions runs every prompt more than once per configuration and "
-            "reports the run-to-run spread, which is also what turns the "
-            "significance verdicts on. Total time is every pair's prompt count "
-            "multiplied by repetitions, which is why this runs asynchronously; "
-            "use the synchronous ollama_run_benchmark when the measurements are "
-            "wanted in one call. Verify every model with ollama_list_models "
+            "Every configuration answers shared_prompts before its own; a "
+            "model with no configurations runs once under its defaults. One "
+            "model carrying several configurations compares parameter sets; "
+            "several models under one shared configuration compare models. "
+            "Models run one after another — each is unloaded before the next "
+            "loads, so timings never compete for VRAM. Returns immediately "
+            "with a progress_id — an acknowledgement that the benchmark has "
+            "started, NOT its results, which do not exist yet. Say that it "
+            "has started, end the turn and go to sleep; when the user calls "
+            "again, poll progress_get_status with that id until the status "
+            "is 'completed', 'failed' or 'cancelled', then call "
+            "benchmark_get_result with the same id to obtain the "
+            "side-by-side measurements and the two-way 'significance' "
+            "assessment ('by_model' and 'across_models'). repetitions runs "
+            "every prompt more than once per configuration and reports the "
+            "run-to-run spread, which is also what turns the significance "
+            "verdicts on. Total time is every pair's prompt count multiplied "
+            "by repetitions. Verify every model with ollama_list_models "
             "first, and prefer the smallest prompt list that can tell the "
             "subjects apart."
         ),
         annotations=LONG_RUNNING,
     )
     @surface_core_errors
-    def ollama_run_benchmark_with_progress(
+    def ollama_run_benchmark(
         experiments: list[dict],
         shared_prompts: list[str] | None = None,
         include_output: bool = False,

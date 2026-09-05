@@ -718,9 +718,9 @@ def _business_result(result: dict) -> dict:
     """Shape a stored comparison result as the benchmark's deliverable.
 
     A single test is one configuration or one model, so its result is unwrapped
-    to the shape ``ollama_run_test`` returns. A comparison keeps MSHCore's own
-    shape. Applied when the result is fetched rather than when it is stored:
-    the benchmark history keeps every comparison whole.
+    from the comparison wrapper to that test's own measurements. A comparison
+    keeps MSHCore's own shape. Applied when the result is fetched rather than
+    when it is stored: the benchmark history keeps every comparison whole.
 
     Args:
         result: Return value of ``ollama_runner.run_benchmark``.

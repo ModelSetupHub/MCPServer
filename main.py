@@ -50,7 +50,7 @@ except ImportError as error:
     ) from error
 
 from MSHCore import logging as core_logging  # noqa: E402
-from MSHCore.benchmark import history, ollama_runner  # noqa: E402
+from MSHCore.benchmark import history  # noqa: E402
 from MSHCore.system import hardware, scanner  # noqa: E402
 from MSHCore.download_manager.manager import DownloadManager  # noqa: E402
 
@@ -96,12 +96,11 @@ restricted to a fixed domain whitelist.
   system_scan, which on Windows makes eight subprocess calls and can take
   tens of seconds — do not call it for a single number. system_scan reports
   memory and storage in GiB; the narrow tools report raw bytes.
-- Generate text: ollama_run_model. Measure speed: ollama_run_test. Run a
-  benchmark matrix — one model under several configurations, several models
-  under one shared configuration, or any mix: ollama_run_benchmark. Only
-  ollama_configure_model creates a
-  persistent model variant; the benchmark tools apply parameters per request
-  and create nothing.
+- Generate text: ollama_run_model. Measure speed: ollama_run_benchmark —
+  one model under several configurations, several models under one shared
+  configuration, or any mix, as the experiments matrix. Only
+  ollama_configure_model creates a persistent model variant; the benchmark
+  tool applies parameters per request and creates nothing.
 - One file from the web: download_file, the primary download tool.
 - Several files as one unit of work: the session ceremony below.
 - Revisit a past benchmark: benchmark_list_history then
@@ -118,7 +117,7 @@ several calls; nothing is transferred until the queue is started:
     download_create_session       create an empty named queue
     download_add, download_add_many
                                   enqueue URLs only, transfer nothing
-    download_start_with_progress  begin the transfer (or download_start)
+    download_start                begin the transfer
 
 Skipping the start leaves a queue that never runs. download_file performs all
 three steps itself, so never pair it with them.
@@ -149,14 +148,13 @@ first call already returned it, and a second call starts a second operation.
 Immediate: every read-only tool, and every download_* queue-control tool.
 
 Blocking until finished, with no progress reporting: ollama_run_model,
-ollama_run_test, ollama_run_benchmark, ollama_start,
-ollama_stop, ollama_install, python_run_script, python_install_packages,
-python_create_environment and python_install_python. None has a timeout,
-several take minutes, and installers have no progress variant at all.
+ollama_start, ollama_stop, ollama_install, python_run_script,
+python_install_packages, python_create_environment and python_install_python.
+None has a timeout, several take minutes, and installers have no progress
+variant at all.
 
-Background, returning a progress_id at once: download_file,
-download_start_with_progress, ollama_run_test_with_progress and
-ollama_run_benchmark_with_progress.
+Background, returning a progress_id at once: download_file, download_start
+and ollama_run_benchmark.
 Track them with progress_get_status(progress_id), which is a fast,
 non-blocking read of a recorded snapshot: status is 'starting' or 'running'
 while work continues, then 'completed', 'failed' or 'cancelled'. It answers
@@ -189,9 +187,6 @@ The two kinds differ in what waking up means:
   configurations against each other, 'across_models' judges the models against
   each other. A verdict's 'significant' is a real true/false when repetitions
   ran above 1, null when each prompt was measured once.
-
-Use the synchronous ollama_run_test or ollama_run_benchmark when you want
-the measurements from a single call and no progress bar.
 
 ## Controlling a running operation
 
@@ -723,10 +718,11 @@ def register_ollama_model_tools(server: MCPServer) -> None:
             "Ollama service to be running and model_name to be installed, as "
             "printed by ollama_list_models. Single-shot: no conversation "
             "history is kept, so each call is independent, and generation "
-            "parameters cannot be set here — use ollama_run_test to vary "
-            "them, or ollama_configure_model to bake them into a variant. "
-            "Returns the generated text only, with no timings or token "
-            "counts; use ollama_run_test when you need measurements. Blocks "
+            "parameters cannot be set here — use ollama_run_benchmark to "
+            "vary them, or ollama_configure_model to bake them into a "
+            "variant. Returns the generated text only, with no timings or "
+            "token counts; use ollama_run_benchmark when you need "
+            "measurements. Blocks "
             "for the whole generation with no timeout and no progress "
             "reporting, which for a large model or a long prompt can be "
             "minutes."
@@ -874,8 +870,8 @@ def register_ollama_model_tools(server: MCPServer) -> None:
             "Create a new, separately named model from an existing one with "
             "Modelfile PARAMETER values baked in, for example temperature or "
             "num_ctx. Use this only when a persistent variant is wanted — for "
-            "trying parameters out, ollama_run_test and ollama_run_benchmark "
-            "apply them per request and create nothing. Requires the Ollama "
+            "trying parameters out, ollama_run_benchmark "
+            "applies them per request and creates nothing. Requires the Ollama "
             "service to be running and source_model to be installed, as "
             "printed by ollama_list_models. source_model is left completely "
             "unchanged. target_model is the new name: an existing model of "
@@ -959,193 +955,24 @@ def register_ollama_model_tools(server: MCPServer) -> None:
 # ============================================================
 
 def register_benchmark_tools(server: MCPServer) -> None:
-    """Register model benchmarking, comparison, and history tools.
+    """Register benchmark history tools.
+
+    The benchmark itself — ``ollama_run_benchmark`` — is the tracked tool
+    bound to the progress panel in ``gui.app``; only the history it saves
+    its completed runs into is registered here as plain tools.
 
     Args:
         server: Server instance the tools are attached to.
     """
-    benchmark = ToolAnnotations(
-        read_only_hint=False,
-        destructive_hint=False,
-        idempotent_hint=False,
-        open_world_hint=False,
-    )
-
-    @server.tool(
-        name="ollama_run_test",
-        title="Benchmark one configuration",
-        description=(
-            "Measure one model's generation performance across a list of "
-            "prompts under a single set of parameters, and return the "
-            "measurements in this one call. Primary tool when you want "
-            "benchmark numbers immediately and no progress bar; use "
-            "ollama_run_test_with_progress instead when a human is watching, "
-            "since that runs in the background and reports progress. Requires "
-            "the Ollama service to be running and model_name to be installed. "
-            "config holds per-request generation options, so no model is "
-            "created or modified — reach for ollama_configure_model only when "
-            "a persistent variant is wanted. repetitions runs every prompt "
-            "more than once and averages the runs: the first repetition "
-            "doubles as the warmup the following ones benefit from, and the "
-            "spread of the timing and rate metrics is reported alongside the "
-            "means, so set it above 1 whenever a conclusion has to survive "
-            "run-to-run noise. Returns one dict with exactly 'name', "
-            "'model', 'configuration', 'repetitions', 'results' (one entry "
-            "per prompt, in order) and 'summary'. A successful prompt entry "
-            "carries 'repetitions' (how many runs were averaged), "
-            "'duration_seconds', 'prompt_tokens', 'output_tokens', "
-            "'prompt_tokens_per_second', 'output_tokens_per_second' and, "
-            "measured at the moment the generation finished: 'ttft_seconds' "
-            "(time to the first streamed token; null when nothing was "
-            "generated), 'vram_used_mb' (whole-GPU usage as the driver "
-            "reports it, every process included) and, when the machine has "
-            "an NVIDIA GPU, 'gpu_temperature_c' and 'gpu_clock_mhz' of the "
-            "hottest GPU — a falling clock beside a rising temperature is "
-            "the trace of a thermal throttle. The timing and rate metrics "
-            "among these also carry '_stddev', '_min' and '_max' variants, "
-            "and a prompt with some failed repetitions reports "
-            "'failed_repetitions'; a rate of null means Ollama did not "
-            "report it, not zero throughput. 'summary' "
-            "holds 'average_duration_seconds', the two average rates, "
-            "'total_output_tokens' and 'output_tokens_per_second_stddev' "
-            "(the pooled run-to-run noise level, null unless repetitions "
-            "were run), computed over successful prompts only. The model is "
-            "preloaded before each repetition and that load time is excluded "
-            "from every figure. A prompt that fails in every repetition is "
-            "recorded with 'success': false and an 'error' instead of "
-            "aborting the run. Leave include_output false unless the "
-            "generated text itself is needed: true adds every full "
-            "completion to the response and can overflow the context. Blocks "
-            "for the sum of all generations — prompts times repetitions — "
-            "with no timeout and no progress reporting."
-        ),
-        annotations=benchmark,
-    )
-    @surface_core_errors
-    def ollama_run_test(
-        model_name: str,
-        prompts: list[str],
-        config: dict | None = None,
-        name: str = "test",
-        include_output: bool = False,
-        repetitions: int = 1,
-    ) -> dict:
-        """Benchmark a model under a single configuration.
-
-        Args:
-            model_name: Model name or tag to benchmark.
-            prompts: Prompts to run, in order.
-            config: Optional generation options, for example
-                {"temperature": 0.7, "num_ctx": 4096}.
-            name: Label recorded with the results.
-            include_output: Whether to include generated text alongside metrics.
-            repetitions: How many times every prompt is executed, from 1.
-
-        Returns:
-            dict: Per-prompt results and a summary of averaged metrics.
-        """
-        return ollama_runner.run_test(
-            model=model_name,
-            prompts=prompts,
-            config=config,
-            name=name,
-            include_output=include_output,
-            repetitions=repetitions,
-        )
-
-    @server.tool(
-        name="ollama_run_benchmark",
-        title="Run a benchmark matrix",
-        description=(
-            "Benchmark a matrix of models, configurations and prompts, and "
-            "return every measurement side by side in this one call. Primary "
-            "tool for systematic comparison when you want the numbers "
-            "immediately; use ollama_run_benchmark_with_progress when a "
-            "human is watching. Requires the Ollama service to be running "
-            "and every model named to be installed; verify with "
-            "ollama_list_models first. experiments is a list of dicts, one "
-            "per model in run order: 'model' (required) is the model name "
-            "or tag, and 'configurations' (optional) a list of dicts, each "
-            "with 'name' (a label; defaults to 'configuration_N'), "
-            "'options' (the generation parameters, defaulting to none) and "
-            "an optional 'prompts' list only that configuration answers. "
-            "Every configuration answers shared_prompts before its own; a "
-            "model with no configurations runs once under its defaults. "
-            "Two shapes cover most needs: one model carrying several "
-            "configurations compares parameter sets, and several models "
-            "under one shared configuration compare models — a fair "
-            "comparison changes one thing at a time. Models run one after "
-            "another — the model measured before is unloaded before the "
-            "next loads, so timings never compete for VRAM; a model that "
-            "was already loaded before the benchmark began is not the "
-            "benchmark's to stop and stays loaded. Parameters are applied "
-            "per request; no model is created or modified. repetitions "
-            "runs every prompt more than once per configuration and "
-            "reports the run-to-run spread with the means; set it above 1 "
-            "whenever the conclusion has to survive noise. Returns one "
-            "dict with exactly 'experiments' (the normalized matrix that "
-            "ran), 'models' (the names, in run order), 'tests' (one full "
-            "ollama_run_test result per model-configuration pair, in run "
-            "order, its 'name' being the configuration's label) and "
-            "'significance', which judges the matrix both ways it can: "
-            "'by_model' maps each model's name to the verdict on its own "
-            "configurations, and 'across_models' judges the models, each "
-            "represented by its fastest configuration — each verdict "
-            "carrying 'leader', 'runner_up', 'difference', 'noise_level', "
-            "'difference_to_noise_ratio', 'significant' and a 'message' "
-            "explaining it. With repetitions above 1 'significant' is a "
-            "real true/false answer to whether the gap exceeds the "
-            "measured noise; at the default of 1 it is null with a message "
-            "saying so — a visible gap between single measurements is not "
-            "evidence. It is advisory; also read the per-test 'summary' "
-            "values yourself. Total cost is every pair's prompt count "
-            "multiplied by repetitions, every one a full generation, and "
-            "it blocks for all of them with no timeout and no progress "
-            "reporting. Leave include_output false unless the generated "
-            "text is needed: true adds every full completion to the "
-            "response and can overflow the context."
-        ),
-        annotations=benchmark,
-    )
-    @surface_core_errors
-    def ollama_run_benchmark(
-        experiments: list[dict],
-        shared_prompts: list[str] | None = None,
-        include_output: bool = False,
-        repetitions: int = 1,
-    ) -> dict:
-        """Benchmark a matrix of models, configurations and prompts.
-
-        Args:
-            experiments: One dict per model, shaped as
-                {"model": "llama3", "configurations": [{"name": "warm",
-                "options": {"temperature": 0.9}}]}.
-            shared_prompts: Prompts every configuration answers.
-            include_output: Whether to include generated text alongside metrics.
-            repetitions: How many times every prompt runs per configuration,
-                from 1.
-
-        Returns:
-            dict: One benchmark result per model-configuration pair and the
-                significance assessments over them.
-        """
-        return ollama_runner.run_benchmark(
-            experiments=experiments,
-            shared_prompts=shared_prompts,
-            include_output=include_output,
-            repetitions=repetitions,
-        )
 
     @server.tool(
         name="benchmark_list_history",
         title="List saved benchmark runs",
         description=(
             "List every benchmark run kept in the history, newest first. "
-            "Every completed background benchmark — "
-            "ollama_run_test_with_progress and "
-            "ollama_run_benchmark_with_progress — is saved here "
-            "automatically, as is nothing else: the synchronous benchmark "
-            "tools return their measurements in the call and store nothing. "
+            "Every completed background benchmark — ollama_run_benchmark — "
+            "is saved here automatically, as is nothing else: the starting "
+            "tool returns only a progress_id, no measurements. "
             "Read-only and cheap: the listing comes from a small index file, "
             "not the results themselves. Call it to revisit a comparison "
             "made earlier, to pick an id for benchmark_get_saved_result, or "
@@ -1871,17 +1698,13 @@ def register_download_tools(server: MCPServer) -> None:
             "download_list_allowed_domains. destination_directory defaults to "
             "%LOCALAPPDATA%\\MSH\\downloads and is created with its parents if "
             "missing; a relative path resolves against this server's working "
-            "directory. Returns immediately by default with a ticket "
+            "directory. Returns immediately with a ticket "
             "carrying 'download_id' (a progress_id — pass it only to "
             "progress_get_status, progress_pause or progress_cancel), "
             "'session_id' (pass it only to the download_* queue tools if the "
             "transfer needs pausing or cancelling through them), "
             "'destination' and 'status'. Those two identifiers are not "
-            "interchangeable. Pass wait=true to block until the transfer "
-            "reaches a terminal state and receive the outcome plus per-file "
-            "details directly — suitable only for a small file, since a "
-            "transfer still running after timeout_seconds comes back with "
-            "'timed_out': true and must be polled anyway. Never overwrites: "
+            "interchangeable. Never overwrites: "
             "when the destination name is already taken the file is saved "
             "under a numbered variant, and 'destination' reports the name "
             "actually used. A rejected domain or an unusable directory fails "
@@ -1900,8 +1723,6 @@ def register_download_tools(server: MCPServer) -> None:
         destination_directory: str = DEFAULT_DOWNLOAD_DIRECTORY,
         filename: str | None = None,
         max_retries: int = 3,
-        wait: bool = False,
-        timeout_seconds: float = 120.0,
     ) -> dict:
         """Download one URL, creating and starting its session in one call.
 
@@ -1912,14 +1733,10 @@ def register_download_tools(server: MCPServer) -> None:
             filename: Optional destination filename; taken from the URL when
                 omitted, and numbered if that name is already taken.
             max_retries: Retry attempts before the transfer is marked failed.
-            wait: Block until the transfer reaches a terminal state instead of
-                returning a ticket.
-            timeout_seconds: How long to block when ``wait`` is set.
 
         Returns:
             dict: A ticket carrying ``download_id``, ``session_id``,
-            ``destination`` and ``status`` when not waiting; the finished
-            outcome, including the per-file status, when waiting.
+            ``destination`` and ``status``.
         """
         # The session is this tool's own bookkeeping, not something the caller
         # named, so the id is generated. It is still returned, because the
@@ -1946,56 +1763,16 @@ def register_download_tools(server: MCPServer) -> None:
 
         destination = _download_destination(manager, destination_directory)
 
-        if not wait:
-            return {
-                "download_id": job.id,
-                "session_id": session_id,
-                "destination": destination,
-                "status": "running",
-                "next_step": (
-                    f"Poll progress_get_status(progress_id='{job.id}') for "
-                    f"progress, or download_get_status(session_id="
-                    f"'{session_id}') for the queue's own view."
-                ),
-            }
-
-        finished = job.wait(timeout_seconds)
-        snapshot = job.snapshot()
-
-        if not finished:
-            # Still transferring. The session stays registered so the caller can
-            # keep polling it rather than starting the download again.
-            return {
-                "download_id": job.id,
-                "session_id": session_id,
-                "destination": destination,
-                "status": "running",
-                "timed_out": True,
-                "message": (
-                    f"Still downloading after {timeout_seconds} seconds. Poll "
-                    f"progress_get_status(progress_id='{job.id}')."
-                ),
-            }
-
-        # Read the queue before discarding the session: the discard purges it.
-        final = manager.get_status()
-        # The worker resolves the name again just before transferring, so this is
-        # where a rename shows up. A cancellation may already have purged the
-        # queue, in which case the name from before the wait still stands.
-        destination = (
-            _download_destination(manager, destination_directory) or destination
-        )
-        _discard_session(session_id)
-
         return {
             "download_id": job.id,
             "session_id": session_id,
             "destination": destination,
-            "status": snapshot["status"],
-            "message": snapshot.get("message"),
-            "error": snapshot.get("error"),
-            "elapsed_seconds": snapshot.get("elapsed_seconds"),
-            "files": final["downloads"],
+            "status": "running",
+            "next_step": (
+                f"Poll progress_get_status(progress_id='{job.id}') for "
+                f"progress, or download_get_status(session_id="
+                f"'{session_id}') for the queue's own view."
+            ),
         }
 
     @server.tool(
@@ -2005,7 +1782,7 @@ def register_download_tools(server: MCPServer) -> None:
             "STEP 1 of 3 for downloading several files as one unit of work: "
             "create an empty named queue. Nothing is downloaded here — follow "
             "with download_add or download_add_many for every file, then "
-            "download_start_with_progress (or download_start) to begin "
+            "download_start to begin "
             "transferring. For a single file use download_file instead, which "
             "does all three steps itself. session_id is a name you choose; it "
             "is the handle every other download_* tool takes, and it is NOT a "
@@ -2093,7 +1870,7 @@ def register_download_tools(server: MCPServer) -> None:
             "STEP 2 of 3: append one URL to an existing session's queue, with "
             "control over its filename. ENQUEUES ONLY — nothing is "
             "transferred and no network request is made until "
-            "download_start_with_progress or download_start is called on the "
+            "download_start is called on the "
             "same session. Requires download_create_session first: session_id "
             "is that session's name, never a progress_id. url must be http or "
             "https on a host from download_list_allowed_domains; a rejected "
@@ -2140,8 +1917,8 @@ def register_download_tools(server: MCPServer) -> None:
         description=(
             "STEP 2 of 3, batched: append several URLs to an existing "
             "session's queue in order, each named after its own URL. ENQUEUES "
-            "ONLY — nothing is transferred until download_start_with_progress "
-            "or download_start is called. Requires download_create_session "
+            "ONLY — nothing is transferred until "
+            "download_start is called. Requires download_create_session "
             "first: session_id is that session's name, never a progress_id. "
             "Use download_add instead when any file needs an explicit "
             "filename. NOT ATOMIC: validation happens per URL as the list is "
@@ -2173,47 +1950,6 @@ def register_download_tools(server: MCPServer) -> None:
         """
         manager = _get_session(session_id)
         manager.add_many(urls=urls)
-        return manager.get_status()
-
-    @server.tool(
-        name="download_start",
-        title="Start downloading",
-        description=(
-            "STEP 3 of 3: begin transferring a session's queue. Secondary "
-            "option — prefer download_start_with_progress, which does the "
-            "same thing and renders a live progress bar; use this one only "
-            "when no progress bar is wanted. Requires download_create_session "
-            "and at least one download_add or download_add_many first, and "
-            "fails when the queue is empty; session_id is that session's "
-            "name, never a progress_id. Returns immediately: files transfer "
-            "one at a time on a background thread with automatic retry and "
-            "resume, so the returned status shows the queue only as it was at "
-            "the moment of starting. This tool mints no progress_id — track "
-            "the queue with download_get_status(session_id) instead, and use "
-            "download_start_with_progress if you want an id for "
-            "progress_get_status. Does nothing when the session is already "
-            "running. Restarting a session retries files that failed and "
-            "leaves completed, skipped and cancelled ones alone."
-        ),
-        annotations=ToolAnnotations(
-            read_only_hint=False,
-            destructive_hint=False,
-            idempotent_hint=True,
-            open_world_hint=True,
-        ),
-    )
-    @surface_core_errors
-    def download_start(session_id: str) -> dict:
-        """Start a session's download queue.
-
-        Args:
-            session_id: Target session.
-
-        Returns:
-            dict: Session status just after starting.
-        """
-        manager = _get_session(session_id)
-        manager.start()
         return manager.get_status()
 
     @server.tool(
@@ -2263,7 +1999,7 @@ def register_download_tools(server: MCPServer) -> None:
             "Non-destructive: the queue, the files already completed and the "
             "active file's partial data are all kept, so download_resume "
             "continues from where it stopped rather than restarting. Requires "
-            "a session that download_start or download_start_with_progress "
+            "a session that download_start "
             "has started; session_id is the queue's name, never a progress_id "
             "— the progress_id equivalent is progress_pause. Returns "
             "immediately; the transfer stops at its next chunk boundary, so "
@@ -2305,7 +2041,7 @@ def register_download_tools(server: MCPServer) -> None:
             "immediately with the session's status; the transfer picks up on "
             "its background thread. Does nothing when the session is not "
             "paused, so it cannot be used to start a queue that was never "
-            "started — use download_start_with_progress or download_start for "
+            "started — use download_start for "
             "that. It cannot revive a cancelled session either: that requires "
             "creating the session again."
         ),
