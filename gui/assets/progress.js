@@ -365,7 +365,7 @@
     // An import reports nothing while it runs: no bar, no steps, no status
     // text — the title and badge are the whole view. Only a failure earns
     // a line.
-    var silent = snapshot.type === "importmodel";
+    var silent = snapshot.type === "addmodel";
 
     // Suspended and cancelling are flags on a running job, shown as their own
     // badge because that is what the user is looking for.
@@ -415,7 +415,7 @@
       return "Downloading";
     }
 
-    if (snapshot.type === "importmodel") {
+    if (snapshot.type === "addmodel") {
       return "Importing model";
     }
 

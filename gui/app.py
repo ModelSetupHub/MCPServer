@@ -168,7 +168,7 @@ def register_progress_tools(server: Any) -> None:
             "its tracked tool returned. Fast and non-blocking: it reads the "
             "operation's recorded state, it does not wait for it. Returns one "
             "dict with exactly these keys: 'found' (true), 'id', 'type' "
-            "('download', 'benchmark' or 'importmodel'), 'title', 'status' "
+            "('download', 'benchmark' or 'addmodel'), 'title', 'status' "
             "('starting' or 'running' while the work continues, then one of "
             "'completed', 'failed' or 'cancelled'), 'progress' (0-100 rounded "
             "to one decimal, or null when the remaining work cannot be "

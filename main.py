@@ -137,7 +137,7 @@ three steps itself, so never pair it with them.
   returns it; you never choose it. Only progress_get_status,
   benchmark_get_result, progress_cancel and progress_pause accept it. Format:
   'download-<date>-<time>-<8 hex>', 'benchmark-<date>-<time>-<8 hex>' or
-  'importmodel-<date>-<time>-<8 hex>'.
+  'addmodel-<date>-<time>-<8 hex>'.
 - benchmark_id names one run kept in the benchmark history. benchmark_list_history
   lists them; benchmark_get_saved_result and benchmark_delete_history take
   one. Format: '<date>T<time>_<6 hex>'. A history id and a progress_id are

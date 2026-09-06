@@ -835,7 +835,7 @@ def start_add_model(model_name: str, model_path: str) -> Job:
         Job: The job, already persisted, whose id the panel polls.
     """
     job = Job(
-        kind="importmodel",
+        kind="addmodel",
         title=f"Importing {model_name}",
     )
 
@@ -855,7 +855,7 @@ def start_add_model(model_name: str, model_path: str) -> Job:
     _spawn(
         job,
         lambda: _run_add_model(job=job, token=token, run=run),
-        name=f"importmodel-{model_name}",
+        name=f"addmodel-{model_name}",
     )
 
     return job
