@@ -839,6 +839,45 @@ def register_ollama_model_tools(server: MCPServer) -> None:
         return model.stop_model(model=model_name)
 
     @server.tool(
+        name="delete_model_file",
+        title="Delete a model weights file",
+        description=(
+            "Delete one model weights file from disk — the .gguf a manual "
+            "download or a download_file call produced and an import has "
+            "already copied into Ollama's store. DESTRUCTIVE and "
+            "IRREVERSIBLE: the file is unlinked immediately, not moved to a "
+            "recycle bin, and there is no backup. model_path is a local "
+            "filesystem path, typically the 'destination' download_file "
+            "reported; only files ending in '.gguf' are accepted, so a "
+            "mistyped path fails rather than removing anything else. "
+            "Deleting the file does not touch Ollama: a model already "
+            "registered from it keeps working, since the import copied the "
+            "weights — delete the registered copy with ollama_remove_model "
+            "instead, and neither undoes the other. Confirm the path with "
+            "the user before calling when the model was not imported in "
+            "this conversation. Returns the deleted file's absolute path. "
+            "Fails when the path is not a .gguf file or does not exist."
+        ),
+        annotations=ToolAnnotations(
+            read_only_hint=False,
+            destructive_hint=True,
+            idempotent_hint=True,
+            open_world_hint=False,
+        ),
+    )
+    @surface_core_errors
+    def delete_model_file(model_path: str) -> str:
+        """Delete a GGUF model weights file from disk.
+
+        Args:
+            model_path: Path to the model file on disk.
+
+        Returns:
+            str: Absolute path of the deleted file.
+        """
+        return model.delete_model_file(model_path=model_path)
+
+    @server.tool(
         name="ollama_configure_model",
         title="Create a configured model variant",
         description=(
