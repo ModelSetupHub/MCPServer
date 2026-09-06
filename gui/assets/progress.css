@@ -1,78 +1,52 @@
 /* ModelSetupHub progress panel — inlined into progress.html at import time.
  *
- * The palette is defined here rather than inherited from the host's style
- * variables. Those variables are meant for a host's own chrome, and adopting
- * them for this panel produced text that was hard to read — a "secondary" or
- * "tertiary" colour intended for a label on the host's background does not
- * necessarily have enough contrast on the panel's own surfaces. Fonts and
- * corner radii still follow the host, since those cannot hurt legibility.
+ * The panel mirrors the WebApp's design system: the same palette of
+ * surfaces, borders, text tiers and accent colours defined in
+ * WebApp/static/css/base/tokens.css, the same Inter / JetBrains Mono
+ * pairing, and the same component idioms (the panel card, the left
+ * status stripe borrowed from the toast, the flat-accent track fill).
  *
- * Every text colour below is checked against the surface it actually sits on:
- * body text and headings well past the 4.5:1 the WCAG AA text threshold asks
- * for, and the dimmest supporting text still above it.
+ * A host may still re-theme the panel through the variables it publishes
+ * with `ui/notifications/host-context-changed`: any `--bg`, `--panel`,
+ * `--accent-*` … variable it sends lands on the same names below, so a
+ * differently coloured host recolours the panel without a fork here.
+ * Fonts and radii come from the host's variables when it provides them.
+ *
+ * The panel ships dark-only, like the WebApp; every text colour below is
+ * checked against the surface it sits on and clears the WCAG AA 4.5:1
+ * text threshold.
  */
 
 :root {
   color-scheme: dark;
 
-  --msh-bg: #0f1216;
-  --msh-card: #191d24;
-  --msh-raised: #232932;
+  /* WebApp/static/css/base/tokens.css — a host can override any of these
+     by publishing the same variable names with the host context. */
+  --bg: #0e1116;
+  --panel: #161b22;
+  --panel-raised: #1d242d;
+  --border-soft: #232b35;
+  --border-strong: #2e3742;
 
-  /* On --msh-card: 14.6:1, 8.1:1, 5.4:1; all three also clear AA on the raised
-     surfaces the steps sit on. */
-  --msh-text: #f2f5f8;
-  --msh-muted: #b9c3d0;
-  --msh-faint: #93a0af;
+  --text: #e9edf2;
+  --text-dim: #97a3b3;
+  --text-faint: #5f6b7a;
 
-  --msh-border: #333b46;
-  --msh-border-strong: #46505e;
+  --accent-green: #56d89a;
+  --accent-green-dim: #163d2e;
+  --accent-amber: #f0b457;
+  --accent-amber-dim: #40301a;
+  --accent-red: #f2685f;
+  --accent-red-dim: #40201e;
+  --accent-blue: #5aa9f5;
+  --accent-blue-dim: #142c45;
+  --accent-violet: #a78bfa;
+  --accent-violet-dim: #2a2143;
 
-  --msh-accent: #5b9cff;
-  --msh-accent-soft: rgba(91, 156, 255, 0.24);
-  --msh-ok: #3fb950;
-  --msh-warn: #e3b341;
-  --msh-error: #f0564d;
-
-  /* Status text sits on --msh-raised, so it is lightened away from the fill
-     colours, which are tuned for a bar rather than for lettering. */
-  --msh-ok-text: #6ee787;
-  --msh-warn-text: #f2cc60;
-  --msh-error-text: #ff9c94;
-  --msh-accent-text: #8cb8ff;
-
-  --msh-radius: var(--border-radius-lg, 14px);
-  --msh-radius-sm: var(--border-radius-sm, 8px);
-  --msh-sans: var(--font-sans, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif);
-  --msh-mono: var(--font-mono, ui-monospace, SFMono-Regular, "Cascadia Mono", Consolas, monospace);
-}
-
-:root[data-theme="light"] {
-  color-scheme: light;
-
-  --msh-bg: #f4f6f8;
-  --msh-card: #ffffff;
-  --msh-raised: #eceff3;
-
-  /* On --msh-card: 17.8:1, 7.6:1, 5.6:1; the dimmest still clears AA on the
-     raised surfaces too, which is where supporting text actually sits. */
-  --msh-text: #14181d;
-  --msh-muted: #4a5560;
-  --msh-faint: #5b6672;
-
-  --msh-border: #d3d9e0;
-  --msh-border-strong: #b6bfc9;
-
-  --msh-accent: #1f6feb;
-  --msh-accent-soft: rgba(31, 111, 235, 0.18);
-  --msh-ok: #1a7f37;
-  --msh-warn: #9a6700;
-  --msh-error: #cf222e;
-
-  --msh-ok-text: #14682c;
-  --msh-warn-text: #7d5300;
-  --msh-error-text: #b31d29;
-  --msh-accent-text: #0a53c4;
+  --msh-sans: var(--font-sans, "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif);
+  --msh-mono: var(--font-mono, "JetBrains Mono", ui-monospace, SFMono-Regular, Consolas, monospace);
+  --msh-radius: var(--border-radius-lg, 10px);
+  --msh-radius-sm: var(--border-radius-sm, 6px);
 }
 
 * {
@@ -83,17 +57,17 @@ html,
 body {
   margin: 0;
   padding: 0;
-  background: transparent;
-  color: var(--msh-text);
+  background: var(--bg);
+  color: var(--text);
   font-family: var(--msh-sans);
-  font-size: var(--font-text-sm-size, 13px);
-  line-height: var(--font-text-sm-line-height, 1.5);
+  font-size: 13px;
+  line-height: 1.5;
   -webkit-font-smoothing: antialiased;
 }
 
 .panel {
-  background: var(--msh-card);
-  border: 1px solid var(--msh-border);
+  background: var(--panel);
+  border: 1px solid var(--border-soft);
   border-radius: var(--msh-radius);
   padding: 14px 16px 15px;
   display: flex;
@@ -121,90 +95,111 @@ body {
 
 .title {
   margin: 0;
-  font-size: var(--font-text-md-size, 14px);
-  font-weight: var(--font-weight-semibold, 600);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
   overflow-wrap: anywhere;
 }
 
 .subtitle {
   margin: 3px 0 0;
-  color: var(--msh-muted);
-  font-size: var(--font-text-sm-size, 12.5px);
+  color: var(--text-dim);
+  font-size: 12.5px;
   overflow-wrap: anywhere;
 }
 
+/* The WebApp's status stripe: toasts carry a 3px left border in the state
+   colour on a raised surface, so the badge follows the same shape. */
 .badge {
   flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 7px;
   padding: 4px 10px;
-  border-radius: var(--border-radius-full, 999px);
-  background: var(--msh-raised);
-  border: 1px solid var(--msh-border-strong);
-  color: var(--msh-text);
-  font-size: 11.5px;
-  font-weight: var(--font-weight-semibold, 600);
-  letter-spacing: 0.01em;
-  text-transform: capitalize;
+  border-radius: var(--msh-radius-sm);
+  background: var(--panel-raised);
+  border: 1px solid var(--border-strong);
+  border-left: 3px solid var(--text-faint);
+  color: var(--text);
+  font-family: var(--msh-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
   white-space: nowrap;
+  text-transform: lowercase;
 }
 
-/* The dot carries the state colour; the label stays at full-contrast text, so
-   the state is never conveyed by a colour that is hard to read. */
+.badge[data-state="running"],
+.badge[data-state="starting"] {
+  border-left-color: var(--accent-blue);
+}
+
+.badge[data-state="completed"] {
+  border-left-color: var(--accent-green);
+}
+
+.badge[data-state="failed"],
+.badge[data-state="cancelled"] {
+  border-left-color: var(--accent-red);
+}
+
+.badge[data-state="paused"],
+.badge[data-state="cancelling"] {
+  border-left-color: var(--accent-amber);
+}
+
+/* The dot carries the state colour; the label stays at full-contrast text,
+   so the state is never conveyed by a colour that is hard to read. */
 .badge::before {
   content: "";
   flex: 0 0 auto;
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: var(--msh-faint);
+  background: var(--text-faint);
 }
 
-.badge[data-state="running"] {
-  border-color: var(--msh-accent-soft);
-}
-
-.badge[data-state="running"]::before {
-  background: var(--msh-accent);
+.badge[data-state="running"]::before,
+.badge[data-state="starting"]::before {
+  background: var(--accent-blue);
   animation: msh-pulse 1.4s ease-in-out infinite;
 }
 
 .badge[data-state="completed"]::before {
-  background: var(--msh-ok);
+  background: var(--accent-green);
 }
 
 .badge[data-state="failed"]::before,
 .badge[data-state="cancelled"]::before {
-  background: var(--msh-error);
+  background: var(--accent-red);
 }
 
 .badge[data-state="paused"]::before,
 .badge[data-state="cancelling"]::before {
-  background: var(--msh-warn);
+  background: var(--accent-amber);
 }
 
 .badge[data-state="cancelling"]::before {
   animation: msh-pulse 1.4s ease-in-out infinite;
 }
 
-/* Two controls, deliberately weighted differently. Cancel ends the task and
-   cannot be undone, so it is filled red and reads as destructive at a glance.
-   Stop only suspends a download and is fully reversible, so it stays a quiet
-   outlined button — side by side in the same red, they would invite pressing
-   the wrong one. */
+/* Two controls, deliberately weighted differently, on the WebApp's button
+   recipe: raised surface, 1px strong border, 6px radius. Cancel ends the
+   task and cannot be undone, so it is filled red and reads as destructive
+   at a glance. Stop only suspends a download and is fully reversible, so
+   it stays a quiet outlined button — side by side in the same red, they
+   would invite pressing the wrong one. */
 .btn {
   display: inline-flex;
   align-items: center;
   gap: 6px;
   padding: 5px 12px;
-  border-radius: var(--border-radius-full, 999px);
-  font-family: inherit;
+  border-radius: var(--msh-radius-sm);
+  font-family: var(--msh-sans);
   font-size: 12px;
-  font-weight: var(--font-weight-semibold, 600);
-  line-height: 1.2;
+  font-weight: 500;
+  line-height: 1.35;
   cursor: pointer;
-  transition: background 140ms ease, border-color 140ms ease, opacity 140ms ease;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
 }
 
 .btn::before {
@@ -216,19 +211,20 @@ body {
 }
 
 .btn:disabled {
-  opacity: 0.65;
-  cursor: default;
+  color: var(--text-faint);
+  cursor: not-allowed;
+  opacity: 0.85;
 }
 
 .btn:focus-visible {
-  outline: 2px solid currentColor;
+  outline: 2px solid var(--accent-blue);
   outline-offset: 2px;
 }
 
 .cancel {
-  border: 1px solid transparent;
-  background: var(--msh-error);
-  color: #ffffff;
+  border: 1px solid var(--accent-red);
+  background: var(--accent-red-dim);
+  color: var(--accent-red);
 }
 
 /* A cross, for the control that ends the task. */
@@ -241,13 +237,14 @@ body {
 }
 
 .cancel:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--msh-error) 82%, #000000);
+  background: var(--accent-red);
+  color: var(--bg);
 }
 
 .pause {
-  border: 1px solid var(--msh-border-strong);
-  background: var(--msh-raised);
-  color: var(--msh-text);
+  border: 1px solid var(--border-strong);
+  background: var(--panel-raised);
+  color: var(--text);
 }
 
 /* A square, the conventional mark for stopping without discarding. */
@@ -256,15 +253,19 @@ body {
 }
 
 .pause:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--msh-raised) 80%, var(--msh-text));
-  border-color: var(--msh-faint);
+  border-color: var(--accent-blue-dim);
+  background: var(--accent-blue-dim);
+  color: var(--accent-blue);
 }
 
+/* The bar sits on the panel with a track sunk to the app background, as
+   `.bench-progress-track` does in the WebApp. */
 .bar {
   position: relative;
-  height: 9px;
-  border-radius: var(--border-radius-full, 999px);
-  background: var(--msh-raised);
+  height: 8px;
+  border-radius: 999px;
+  background: var(--bg);
+  border: 1px solid var(--border-soft);
   overflow: hidden;
 }
 
@@ -272,26 +273,22 @@ body {
   height: 100%;
   width: 0%;
   border-radius: inherit;
-  background: linear-gradient(
-    90deg,
-    var(--msh-accent),
-    color-mix(in srgb, var(--msh-accent) 60%, #a6c8ff)
-  );
-  transition: width 320ms cubic-bezier(0.32, 0.72, 0, 1);
+  background: var(--accent-blue);
+  transition: width 0.6s ease;
 }
 
 .bar[data-state="completed"] .bar-fill {
-  background: var(--msh-ok);
+  background: var(--accent-green);
 }
 
 .bar[data-state="failed"] .bar-fill,
 .bar[data-state="cancelled"] .bar-fill {
-  background: var(--msh-error);
+  background: var(--accent-red);
 }
 
 .bar[data-state="paused"] .bar-fill,
 .bar[data-state="cancelling"] .bar-fill {
-  background: var(--msh-warn);
+  background: var(--accent-amber);
 }
 
 /* An indeterminate bar means the step reports no measurable total. */
@@ -304,14 +301,14 @@ body {
   display: flex;
   flex-wrap: wrap;
   gap: 5px 16px;
-  color: var(--msh-muted);
-  font-size: var(--font-text-sm-size, 12.5px);
+  color: var(--text-dim);
+  font-size: 12.5px;
 }
 
 .metrics .value {
-  color: var(--msh-text);
+  color: var(--text);
   font-family: var(--msh-mono);
-  font-weight: var(--font-weight-semibold, 600);
+  font-weight: 600;
   font-variant-numeric: tabular-nums;
 }
 
@@ -329,45 +326,55 @@ body {
   grid-template-columns: 1fr auto;
   gap: 3px 10px;
   padding: 9px 11px;
-  border: 1px solid var(--msh-border);
+  border: 1px solid var(--border-soft);
+  border-left: 3px solid var(--border-soft);
   border-radius: var(--msh-radius-sm);
-  background: var(--msh-raised);
+  background: var(--panel-raised);
 }
 
 .step[data-state="running"] {
-  border-color: var(--msh-accent-soft);
+  border-left-color: var(--accent-blue);
+}
+
+.step[data-state="completed"] {
+  border-left-color: var(--accent-green);
+}
+
+.step[data-state="failed"] {
+  border-left-color: var(--accent-red);
 }
 
 .step-name {
   min-width: 0;
-  color: var(--msh-text);
-  font-weight: var(--font-weight-semibold, 600);
+  color: var(--text);
+  font-weight: 600;
   overflow-wrap: anywhere;
 }
 
 .step-value {
-  color: var(--msh-muted);
+  color: var(--text-dim);
   font-family: var(--msh-mono);
-  font-size: 11.5px;
+  font-size: 11px;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
 
 .step-bar {
   grid-column: 1 / -1;
-  height: 5px;
+  height: 6px;
   margin-top: 3px;
 }
 
 .step-note {
   grid-column: 1 / -1;
-  color: var(--msh-muted);
-  font-size: 11.5px;
+  color: var(--text-dim);
+  font-family: var(--msh-mono);
+  font-size: 11px;
   overflow-wrap: anywhere;
 }
 
 .step-note[data-level="error"] {
-  color: var(--msh-error-text);
+  color: var(--accent-red);
 }
 
 .hidden {
@@ -399,6 +406,7 @@ body {
   }
 
   .badge[data-state="running"]::before,
+  .badge[data-state="starting"]::before,
   .badge[data-state="cancelling"]::before,
   .bar[data-indeterminate="true"] .bar-fill {
     animation: none;

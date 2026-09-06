@@ -147,13 +147,13 @@
     }
   }
 
+  // The panel ships with the WebApp's dark palette and does not flip themes:
+  // the WebApp itself is dark-only. A host can still recolour the panel by
+  // publishing variables under the token names the stylesheet uses (--panel,
+  // --accent-blue, …); anything it sends lands on those names.
   function applyTheme(context) {
     if (!context) {
       return;
-    }
-
-    if (context.theme === "light" || context.theme === "dark") {
-      document.documentElement.setAttribute("data-theme", context.theme);
     }
 
     var variables = context.styles && context.styles.variables;
@@ -229,10 +229,12 @@
         "that starts a download, benchmark or model import."
     );
 
-    dom.badge.dataset.state = "completed";
+    // "idle" keeps the badge on its neutral grey: nothing ended, so the green
+    // of a completed state would promise an outcome this view never had.
+    dom.badge.dataset.state = "idle";
     dom.badge.textContent = "idle";
 
-    dom.bar.dataset.state = "completed";
+    dom.bar.dataset.state = "idle";
     dom.bar.dataset.indeterminate = "false";
     dom.barFill.style.width = "0%";
 
