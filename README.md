@@ -53,16 +53,25 @@ records would corrupt the history.
 
 ## The progress panel
 
-Downloads and benchmarks take minutes, which is too long for a chat to sit silent. Those operations have a variant that
-draws a **live progress bar inside the conversation itself**, next to the assistant's message: an overall percentage,
-one row per file or per configuration, and the current transfer rate.
+Downloads, benchmarks and model imports take minutes, which is too long for a chat
+to sit silent. Those operations have a variant that draws a **live progress view
+inside the conversation itself**, next to the assistant's message: an overall
+percentage and one row per file or configuration for downloads and benchmarks,
+and for a model import just its name and a status badge — nothing else while
+it runs, with only a failure putting a line under the title. Importing
+deliberately shows no percentage and carries no Cancel: the read that opens
+the import is long and unmeasurable, so a bar would sit at zero and then race
+to 100 while the work continues, and the import is left to finish on its own.
 
 The panel carries its own controls, and they do different things:
 
-- **Cancel** ends the operation *and undoes it*. A cancelled download deletes the files that download produced; a
-  cancelled benchmark discards its partial measurements and unloads the model it had loaded. It cannot be undone.
-- **Stop** appears for downloads only and merely suspends the transfer. The queue and the data already fetched are kept,
-  and pressing it again continues the current file from where it left off.
+- **Cancel** ends the operation *and undoes it*. A cancelled download deletes the
+  files that download produced; a cancelled benchmark discards its partial
+  measurements and unloads the model it had loaded. It cannot be undone, and it
+  does not appear on a model import's view.
+- **Stop** appears for downloads only and merely suspends the transfer. The queue
+  and the data already fetched are kept, and pressing it again continues the
+  current file from where it left off.
 
 The bar keeps working across a page reload or a reopened conversation, because its state is stored on disk rather than
 held in memory. Operations with nothing measurable to report — installations, a hardware scan — have no progress variant.

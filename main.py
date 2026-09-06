@@ -104,6 +104,8 @@ restricted to a fixed domain whitelist.
   configuration, or any mix, as the experiments matrix. Only
   ollama_configure_model creates a persistent model variant; the benchmark
   tool applies parameters per request and creates nothing.
+- Adopt a local weights file: ollama_add_model, which imports it in the
+  background under a minimal status badge and returns a progress_id.
 - One file from the web: download_file, the primary download tool.
 - Several files as one unit of work: the session ceremony below.
 - Revisit a past benchmark: benchmark_list_history then
@@ -134,7 +136,8 @@ three steps itself, so never pair it with them.
 - progress_id names one background operation. A tracked tool mints it and
   returns it; you never choose it. Only progress_get_status,
   benchmark_get_result, progress_cancel and progress_pause accept it. Format:
-  'download-<date>-<time>-<8 hex>' or 'benchmark-<date>-<time>-<8 hex>'.
+  'download-<date>-<time>-<8 hex>', 'benchmark-<date>-<time>-<8 hex>' or
+  'importmodel-<date>-<time>-<8 hex>'.
 - benchmark_id names one run kept in the benchmark history. benchmark_list_history
   lists them; benchmark_get_saved_result and benchmark_delete_history take
   one. Format: '<date>T<time>_<6 hex>'. A history id and a progress_id are
@@ -155,28 +158,34 @@ ollama_start, ollama_stop, ollama_install, python_run_script,
 python_install_packages, python_create_environment and python_install_interpreter.
 Only ollama_start and ollama_stop take a timeout argument (15 and 10 seconds
 by default); the rest have none, several take minutes, and installers have no
-progress variant at all.
+progress variant at all. A model import is deliberately not on this list:
+ollama_add_model is tracked and reports a progress bar, so it runs in the
+background instead.
 
-Background, returning a progress_id at once: download_file, download_start
-and benchmark_run.
+Background, returning a progress_id at once: download_file, download_start,
+benchmark_run and ollama_add_model.
 Track them with progress_get_status(progress_id), which is a fast,
 non-blocking read of a recorded snapshot: status is 'starting' or 'running'
 while work continues, then 'completed', 'failed' or 'cancelled'. It answers
 after the operation ends and after this server restarts. An unknown id
 reports found=false and is never answered with another operation's progress.
 
-Both kinds run without you, and benchmarks follow the same behaviour as
-downloads: after starting either one, say that it has started, then end the
-turn and go to sleep. Never hold the turn open polling in a loop — minutes
+All of them run without you, and every tracked operation follows the same
+behaviour: after starting one, say that it has started, then end the turn
+and go to sleep. Never hold the turn open polling in a loop — minutes
 of polling stall the conversation, the operation runs to completion without
 you either way, and its progress bar keeps updating itself. When the user
 calls again, wake up, call progress_get_status once with the progress_id,
 and take it from there.
 
-The two kinds differ in what waking up means:
+The kinds differ in what waking up means:
 
 - Downloads have nothing to collect: starting the transfer is the whole
   job, and the poll only confirms the outcome.
+- Model imports are the same: the import is the whole job. A 'completed'
+  status means the model is registered and usable — nothing to fetch, only
+  ollama_list_models to confirm it if wanted. A failed or cancelled import
+  registers nothing under the name.
 - Benchmarks return an acknowledgement containing no measurements. On
   waking, call progress_get_status with the same id until the status is
   terminal, then call benchmark_get_result(progress_id) with it: that reads
@@ -197,12 +206,13 @@ The two kinds differ in what waking up means:
 Two controls take a progress_id:
 
 - progress_cancel ends the operation and has MSHCore undo it — partial and
-  completed downloads are deleted, a loaded model is unloaded — and records a
-  'cancelled' entry that logs_read will show. Applies to downloads and
-  benchmarks. Cannot be undone.
+  completed downloads are deleted, a loaded model is unloaded, an import's
+  'ollama create' process is killed so nothing registers under the name —
+  and records a 'cancelled' entry that logs_read will show. Applies to
+  downloads, benchmarks and model imports. Cannot be undone.
 - progress_pause suspends a download and keeps the queue, the fetched files
-  and the partial data; calling it again resumes. Downloads only; a benchmark
-  reports pause_action='unavailable'.
+  and the partial data; calling it again resumes. Downloads only; a
+  benchmark or a model import reports pause_action='unavailable'.
 
 Cancelling a download also removes its session: the id becomes free, and
 downloading the same files again means calling download_create_session and
@@ -827,45 +837,6 @@ def register_ollama_model_tools(server: MCPServer) -> None:
             str: Output from 'ollama stop'.
         """
         return model.stop_model(model=model_name)
-
-    @server.tool(
-        name="ollama_add_model",
-        title="Import a local model file",
-        description=(
-            "Register a model weights file already on disk — typically a "
-            ".gguf — with Ollama under a new name, making it usable by every "
-            "other ollama_* tool. Primary tool for adopting a manually "
-            "obtained model. model_path is a local filesystem path to that "
-            "weights file, not a URL: download it first with download_file "
-            "and pass the 'destination' that reported. Requires the Ollama "
-            "service to be running. model_name is the new name to register; "
-            "Ollama overwrites an existing model of that name without "
-            "warning, so check ollama_list_models first. Ollama copies the "
-            "weights into its own store, so this consumes disk space roughly "
-            "equal to the file's size and the original file is left where it "
-            "is. Blocks for the whole import with no timeout and no progress "
-            "reporting. Returns the raw text 'ollama create' prints. Fails "
-            "when the path is not a file."
-        ),
-        annotations=ToolAnnotations(
-            read_only_hint=False,
-            destructive_hint=False,
-            idempotent_hint=False,
-            open_world_hint=False,
-        ),
-    )
-    @surface_core_errors
-    def ollama_add_model(model_name: str, model_path: str) -> str:
-        """Import a local model file into Ollama.
-
-        Args:
-            model_name: Name to register the model under.
-            model_path: Path to the model file on disk.
-
-        Returns:
-            str: Output from 'ollama create'.
-        """
-        return model.add_model(model_name=model_name, model_path=model_path)
 
     @server.tool(
         name="ollama_configure_model",

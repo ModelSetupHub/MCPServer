@@ -138,6 +138,7 @@ def create_progress_app(
     _register_panel_tools(apps)
     _register_download(apps, get_session, register_session, release_session)
     _register_benchmarks(apps)
+    _register_models(apps)
 
     return apps
 
@@ -167,25 +168,28 @@ def register_progress_tools(server: Any) -> None:
             "its tracked tool returned. Fast and non-blocking: it reads the "
             "operation's recorded state, it does not wait for it. Returns one "
             "dict with exactly these keys: 'found' (true), 'id', 'type' "
-            "('download' or 'benchmark'), 'title', 'status' ('starting' or "
-            "'running' while the work continues, then one of 'completed', "
-            "'failed' or 'cancelled'), 'progress' (0-100 rounded to one "
-            "decimal, or null when the remaining work cannot be measured), "
-            "'message', 'error' (set on a failure), 'result_available' (a "
-            "completed benchmark's measurements are ready to fetch with "
-            "benchmark_get_result; the measurements themselves are never "
-            "included here, and this is always false for downloads), "
-            "'benchmark_id' (the history id a completed benchmark was saved "
-            "under, null otherwise), 'steps' (one row per downloaded file, "
-            "per model-configuration pair, or per prompt for a single-pair "
-            "benchmark; each with 'name', 'state' — one of 'waiting', "
-            "'running', 'completed', 'failed', 'skipped', 'cancelled' — "
-            "'percent', 'detail' and 'error'), 'metrics' (label/value "
-            "pairs: downloads report downloaded and total bytes, file n of "
-            "m, and the current speed while something is transferring; "
-            "benchmarks report none), 'paused', 'cancelling' (true between "
-            "a cancel request and the operation actually stopping), "
-            "'can_cancel', 'can_pause' (downloads only) and "
+            "('download', 'benchmark' or 'importmodel'), 'title', 'status' "
+            "('starting' or 'running' while the work continues, then one of "
+            "'completed', 'failed' or 'cancelled'), 'progress' (0-100 rounded "
+            "to one decimal, or null when the remaining work cannot be "
+            "measured), 'message', 'error' (set on a failure), "
+            "'result_available' (a completed benchmark's measurements are "
+            "ready to fetch with benchmark_get_result; the measurements "
+            "themselves are never included here, and this is always false "
+            "for downloads and model imports), 'benchmark_id' (the history "
+            "id a completed benchmark was saved under, null otherwise), "
+            "'steps' (one row per downloaded file, or per "
+            "model-configuration pair, or per prompt for a single-pair "
+            "benchmark; an import carries no steps and no status text — "
+            "its view is the title alone; each with 'name', 'state' — one of "
+            "'waiting', 'running', 'completed', 'failed', 'skipped', "
+            "'cancelled' — 'percent', 'detail' and 'error'), 'metrics' "
+            "(label/value pairs: downloads report downloaded and total "
+            "bytes, file n of m, and the current speed while something is "
+            "transferring; benchmarks and model imports report none), "
+            "'paused', 'cancelling' "
+            "(true between a cancel request and the operation actually "
+            "stopping), 'can_cancel', 'can_pause' (downloads only) and "
             "'elapsed_seconds'. Do not poll in a held-open "
             "loop: after starting an operation, end the turn and go to sleep, "
             "then call this when the user next prompts, repeating only if the "
@@ -460,12 +464,14 @@ def _no_result_reason(snapshot: dict) -> str:
 
 CANCEL_DESCRIPTION = (
     "Cancel the operation with this progress_id and undo what it had done. "
-    "The download or benchmark stops at its next safe point — a chunk "
-    "boundary for a download — and MSHCore undoes what it created: a "
-    "download's partial and completed files are deleted, with files that "
-    "existed before it untouched, a benchmark's loaded model is unloaded "
-    "and its partial measurements discarded, and a 'cancelled' entry is "
-    "recorded in the execution log where logs_read will show it. For a "
+    "The download, benchmark or model import stops at its next safe point — "
+    "a chunk boundary for a download, the next process kill for an import — "
+    "and MSHCore undoes what it created: a download's partial and completed "
+    "files are deleted, with files that existed before it untouched, a "
+    "benchmark's loaded model is unloaded and its partial measurements "
+    "discarded, and an import's 'ollama create' process is killed so nothing "
+    "is registered under the model's name. Every kind records a 'cancelled' "
+    "entry in the execution log where logs_read will show it. For a "
     "download the session is removed too, so every download_* tool refuses "
     "its session_id afterwards and downloading the same files again means "
     "creating it fresh. Cannot be undone; to suspend a download and keep "
@@ -489,9 +495,9 @@ PAUSE_DESCRIPTION = (
     "starting over. Returns the snapshot, in the same shape as "
     "progress_get_status, plus 'pause_action': 'paused' or 'resumed' for "
     "what this call did. 'unavailable' when the id is unknown, the "
-    "operation is not a download — a benchmark reports this rather than "
-    "being paused — has already finished or is being cancelled. Downloads "
-    "only."
+    "operation is not a download — a benchmark or a model import reports "
+    "this rather than being paused — has already finished or is being "
+    "cancelled. Downloads only."
 )
 
 
@@ -709,6 +715,38 @@ def _benchmark_started(job: Job, **extra: Any) -> dict:
             f"benchmark_get_result(progress_id='{job.id}')."
         ),
         "contract": BENCHMARK_CONTRACT,
+    }
+
+
+ADD_MODEL_CONTRACT = (
+    "This import has started and has NOT completed. This response is an "
+    "acknowledgement, not the result. Say that it has started, then end the "
+    "turn and go to sleep — do not hold the turn open polling. When the user "
+    "calls again, poll progress_get_status with this progress_id until its "
+    "status is 'completed', 'failed' or 'cancelled'. A completed import has "
+    "nothing further to fetch: the model is registered and usable at once — "
+    "confirm it with ollama_list_models if the user asks."
+)
+
+
+def _model_started(job: Job, **extra: Any) -> dict:
+    """Build a model-import tool's return value.
+
+    Args:
+        job: Job that was started.
+        extra: Additional fields for the model.
+
+    Returns:
+        dict: Handle plus the contract the model has to follow.
+    """
+    return {
+        **_started(job, **extra),
+        "next_step": (
+            f"End the turn; when the user calls again, poll "
+            f"progress_get_status(progress_id='{job.id}') until it reports a "
+            f"terminal status. A completed import needs no further call."
+        ),
+        "contract": ADD_MODEL_CONTRACT,
     }
 
 
@@ -1003,6 +1041,80 @@ def _register_benchmarks(apps: Apps) -> None:
                 for experiment in experiments
             ),
         )
+
+
+def _register_models(apps: Apps) -> None:
+    """Register the model-import tool bound to the panel.
+
+    ``ollama_add_model`` is the tracked form of the import MSHCore used to
+    expose as a blocking call: it starts a job, shows the bar, and returns the
+    handle. Only the starting form lives here; there is no separate plain
+    tool to migrate a session to.
+
+    Args:
+        apps: Extension the tool is added to.
+    """
+
+    @apps.tool(
+        resource_uri=PROGRESS_URI,
+        name="ollama_add_model",
+        title="Import a local model file",
+        description=(
+            "Register a model weights file already on disk — typically a "
+            ".gguf — with Ollama under a new name, making it usable by every "
+            "other ollama_* tool. Primary tool for adopting a manually "
+            "obtained model. model_path is a local filesystem path to that "
+            "weights file, not a URL: download it first with download_file "
+            "and pass the 'destination' that reported. Requires the Ollama "
+            "service to be running. model_name is the new name to register; "
+            "Ollama overwrites an existing model of that name without "
+            "warning, so check ollama_list_models first. Ollama copies the "
+            "weights into its own store, so this consumes disk space roughly "
+            "equal to the file's size and the original file is left where it "
+            "is. Runs in the background and shows a minimal live view in "
+            "the conversation: the model's name and a status badge, and "
+            "nothing else while it runs — no percentage, no status text, no "
+            "Cancel button. Only a failure puts a line under the title, "
+            "saying why the import failed. The read that opens the import "
+            "is long and unmeasurable, so a bar would sit at zero and then "
+            "race to 100, and the import is left to finish on its own. "
+            "Returns immediately with 'progress_id', "
+            "'status' ('starting'), 'model', 'next_step' and 'contract' — "
+            "an acknowledgement that the import has started, NOT that it "
+            "finished. Say that it has started, end the turn and go to "
+            "sleep; when the user calls again, poll progress_get_status with "
+            "that id until the status is 'completed', 'failed' or "
+            "'cancelled'. A completed import has nothing further to fetch — "
+            "the model is registered and usable at once. Fails immediately "
+            "when the path is not a file."
+        ),
+        annotations=LONG_RUNNING,
+    )
+    @surface_core_errors
+    def ollama_add_model(model_name: str, model_path: str) -> dict:
+        """Import a local model file into Ollama with a progress bar.
+
+        Args:
+            model_name: Name to register the model under.
+            model_path: Path to the model file on disk.
+
+        Returns:
+            dict: The ``progress_id`` to poll, and the contract to follow.
+
+        Raises:
+            ToolError: If the path is not an existing file — checked here
+                because the worker runs after this returns, so a bad path
+                would otherwise surface only on the progress bar.
+        """
+        if not Path(model_path).expanduser().is_file():
+            raise ToolError(f"Model file not found: {model_path}")
+
+        job = workers.start_add_model(
+            model_name=model_name,
+            model_path=model_path,
+        )
+
+        return _model_started(job, model=model_name)
 
 
 def _normalise_experiments(

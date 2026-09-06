@@ -226,7 +226,7 @@
     setText(
       dom.message,
       "This panel has no progress to follow. Progress is reported by the call " +
-        "that starts a download or benchmark."
+        "that starts a download, benchmark or model import."
     );
 
     dom.badge.dataset.state = "completed";
@@ -360,6 +360,11 @@
   function render(snapshot) {
     var status = snapshot.status || "running";
 
+    // An import reports nothing while it runs: no bar, no steps, no status
+    // text — the title and badge are the whole view. Only a failure earns
+    // a line.
+    var silent = snapshot.type === "importmodel";
+
     // Suspended and cancelling are flags on a running job, shown as their own
     // badge because that is what the user is looking for.
     var shown = status;
@@ -376,19 +381,25 @@
     var determinate = percent !== null && percent !== undefined;
 
     dom.title.textContent = snapshot.title || titleFor(snapshot);
-    setText(dom.message, snapshot.error || snapshot.message);
+
+    if (silent && !TERMINAL[status]) {
+      setText(dom.message, "");
+    } else {
+      setText(dom.message, snapshot.error || snapshot.message);
+    }
 
     dom.badge.dataset.state = shown;
     dom.badge.textContent = shown;
 
+    dom.bar.classList.toggle("hidden", silent);
     dom.bar.dataset.state = shown;
     dom.bar.dataset.indeterminate =
-      !determinate && !TERMINAL[status] ? "true" : "false";
+      !silent && !determinate && !TERMINAL[status] ? "true" : "false";
     dom.barFill.style.width = clamp(percent) + "%";
 
-    renderControls(snapshot, status);
-    renderMetrics(snapshot);
-    renderSteps(snapshot.steps || []);
+    renderControls(snapshot, status, silent);
+    renderMetrics(snapshot, silent);
+    renderSteps(silent ? [] : snapshot.steps || []);
 
     // The only thing that ends the polling.
     if (TERMINAL[status]) {
@@ -398,12 +409,22 @@
   }
 
   function titleFor(snapshot) {
-    return snapshot.type === "download" ? "Downloading" : "Benchmarking";
+    if (snapshot.type === "download") {
+      return "Downloading";
+    }
+
+    if (snapshot.type === "importmodel") {
+      return "Importing model";
+    }
+
+    return "Benchmarking";
   }
 
-  function renderControls(snapshot, status) {
-    var canCancel = snapshot.can_cancel === true && !busy;
-    var canPause = snapshot.can_pause === true && !busy;
+  function renderControls(snapshot, status, activity) {
+    // An import offers no Cancel: it is one disk-bound copy whose
+    // interruption buys nothing, so its view carries no buttons at all.
+    var canCancel = snapshot.can_cancel === true && !busy && !activity;
+    var canPause = snapshot.can_pause === true && !busy && !activity;
 
     dom.cancel.classList.toggle("hidden", !canCancel);
     dom.pause.classList.toggle("hidden", !canPause);
@@ -428,11 +449,13 @@
     }
   }
 
-  function renderMetrics(snapshot) {
+  function renderMetrics(snapshot, silent) {
     var parts = [];
     var percent = snapshot.progress;
 
-    if (percent !== null && percent !== undefined) {
+    // A silent view has no meaningful percentage: nothing under the title
+    // would read as progress.
+    if (!silent && percent !== null && percent !== undefined) {
       parts.push(pair(Math.round(clamp(percent)) + "%", "complete"));
     }
 

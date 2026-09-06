@@ -38,6 +38,7 @@ from .app import (
 )
 from .workers import (
     note_download_ended,
+    start_add_model,
     start_benchmark,
     start_download,
 )
@@ -47,6 +48,7 @@ __all__ = [
     "create_progress_app",
     "register_progress_tools",
     "note_download_ended",
+    "start_add_model",
     "start_benchmark",
     "start_download",
 ]

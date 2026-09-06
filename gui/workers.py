@@ -17,7 +17,8 @@ Where the progress figures come from is each worker's business and stops here.
 Downloads read ``DownloadManager.get_status``, which is a real live API. Benchmarks
 are handed their figures by MSHCore itself, through the ``on_progress`` callback it
 invokes before every prompt and after every finished repetition; the worker only
-reshapes those dicts into job steps.
+reshapes those dicts into job steps. Model imports are fed the same way — their
+``on_progress`` carries each reading 'ollama create' draws.
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ from typing import Any
 from MSHCore.benchmark import ollama_runner
 from MSHCore.cancellation import CancellationToken, OperationCancelled
 from MSHCore.download_manager.manager import DownloadManager
+from MSHCore.ollama import model as model_api
 
 from .jobs import (
     CANCELLED,
@@ -812,6 +814,78 @@ def _close_benchmark_steps(job: Job, result: dict, single: bool) -> None:
             state=FAILED if entries and failed == len(entries) else COMPLETED,
             detail=f"{len(entries)}/{len(entries)}",
         )
+
+
+# ============================================================
+# Model imports
+# ============================================================
+
+def start_add_model(model_name: str, model_path: str) -> Job:
+    """Import a local model file into Ollama and follow it on a worker thread.
+
+    The import reports nothing while it runs: no steps, no percentage, no
+    status text. The view is the job's title and its badge, and only a
+    failure earns a line.
+
+    Args:
+        model_name: Name to register the model under.
+        model_path: Path to the model file on disk.
+
+    Returns:
+        Job: The job, already persisted, whose id the panel polls.
+    """
+    job = Job(
+        kind="importmodel",
+        title=f"Importing {model_name}",
+    )
+
+    token = CancellationToken()
+    # The view offers no Cancel button, but progress_cancel remains the one
+    # way to stop an import. The canceller must stay registered: without one,
+    # a cancel request would leave the job cancelling for ever.
+    job.set_cancel(token.cancel)
+
+    def run(cancellation: CancellationToken) -> str:
+        return model_api.add_model(
+            model_name=model_name,
+            model_path=model_path,
+            cancellation=cancellation,
+        )
+
+    _spawn(
+        job,
+        lambda: _run_add_model(job=job, token=token, run=run),
+        name=f"importmodel-{model_name}",
+    )
+
+    return job
+
+
+def _run_add_model(
+    job: Job,
+    token: CancellationToken,
+    run: Callable[[CancellationToken], str],
+) -> None:
+    """Run one model import to a terminal status.
+
+    Args:
+        job: Job to keep current.
+        token: Cancellation token ``progress_cancel`` sets.
+        run: Runs the MSHCore import with the given cancellation token.
+            Called on this worker thread.
+    """
+    try:
+        job.begin()
+
+        output = run(token)
+    except OperationCancelled as error:
+        job.finish(CANCELLED, message=str(error))
+        return
+    except Exception as error:
+        job.finish(FAILED, message="The model import failed.", error=str(error))
+        return
+
+    job.finish(COMPLETED, message=output or "Model registered with Ollama.")
 
 
 # ============================================================
