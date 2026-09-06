@@ -7,7 +7,7 @@ resource the client renders inline in the conversation, in a sandboxed iframe.
 That binding is what draws a progress bar, so it decides which tools may have it.
 A tool bound to the panel gets a new panel every time the *model* calls it, since
 each call is a new tool result in the conversation for the host to render. So only
-the two tools that start an operation are bound to it — one call, one job, one
+the tools that start an operation are bound to it — one call, one job, one
 bar — and everything that merely *reads* or *controls* an existing job is a plain
 tool, registered by :func:`register_progress_tools`, with no UI of its own.
 
@@ -40,11 +40,16 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import functools
+from pathlib import Path
 from typing import Any, TypeVar
+from uuid import uuid4
 
 from mcp.server.apps import Apps
 from mcp.server.mcpserver.exceptions import MCPServerError, ToolError
 from mcp.types import ToolAnnotations
+
+from MSHCore.download_manager.manager import DownloadManager
+from MSHCore.paths import DOWNLOADS_DIRECTORY
 
 from . import workers
 from .jobs import Job, load_job_result, load_snapshot, registry
@@ -91,6 +96,7 @@ def surface_core_errors(function: CallableT) -> CallableT:
 def create_progress_app(
     get_session: Callable[[str], Any],
     release_session: Callable[[str], Any] | None = None,
+    register_session: Callable[[str, Any], None] | None = None,
 ) -> Apps:
     """Build the Apps extension carrying the panel and the tools that draw it.
 
@@ -98,12 +104,17 @@ def create_progress_app(
     panel's own app-visible ones. Reading and controlling a job that already exists
     is registered separately by :func:`register_progress_tools`, so the model can
     poll a benchmark without every poll rendering another progress bar.
+
     Args:
         get_session: Resolver for a download session id, supplied by the layer
             that owns the session registry — ``main.py`` — so this module does not
             duplicate that state.
         release_session: Called with a session id once its queue has stopped, so
-            the owning layer can drop a cancelled session.
+            the owning layer can drop a cancelled session; the single-file
+            download tool also calls it when its own setup fails.
+        register_session: Adds a freshly created session to the owning layer's
+            registry. The single-file download tool generates its own session
+            id and needs it placed where the plain download tools find it.
 
     Returns:
         Apps: Extension to pass as ``MCPServer(extensions=[...])``.
@@ -125,7 +136,7 @@ def create_progress_app(
     )
 
     _register_panel_tools(apps)
-    _register_download(apps, get_session)
+    _register_download(apps, get_session, register_session, release_session)
     _register_benchmarks(apps)
 
     return apps
@@ -208,7 +219,7 @@ def register_progress_tools(server: Any) -> None:
         title="Get a finished benchmark's measurements",
         description=(
             "Retrieve the measurements produced by a benchmark started with "
-            "ollama_run_benchmark, "
+            "benchmark_run, "
             "by its progress_id. This is where a benchmark's actual results come "
             "from: the starting tool returns only a handle, and progress_get_status "
             "reports only progress. Call this once progress_get_status reports "
@@ -701,13 +712,138 @@ def _benchmark_started(job: Job, **extra: Any) -> dict:
     }
 
 
-def _register_download(apps: Apps, get_session: Callable[[str], Any]) -> None:
-    """Register the download tool bound to the panel.
+def _download_destination(manager: DownloadManager, directory: str) -> str | None:
+    """Report the path the single queued file is being written to.
+
+    MSHCore may rename a file to avoid overwriting one already on disk, so the
+    name is read back from the queue rather than assumed from the URL.
 
     Args:
-        apps: Extension the tool is added to.
-        get_session: Resolver for a download session id.
+        manager: Manager holding the one-file queue.
+        directory: Directory the session writes into.
+
+    Returns:
+        str | None: Full path to the file, or None when the queue is empty.
     """
+    downloads = manager.get_status()["downloads"]
+
+    if not downloads:
+        return None
+
+    return str(Path(directory) / downloads[0]["filename"])
+
+
+def _register_download(
+    apps: Apps,
+    get_session: Callable[[str], Any],
+    register_session: Callable[[str, Any], None] | None,
+    release_session: Callable[[str], Any] | None,
+) -> None:
+    """Register the download tools bound to the panel.
+
+    Both are starting tools: ``download_file`` builds its own one-file session
+    and starts it, and ``download_start`` sets a session the plain queue tools
+    built running. The session registry itself stays with the layer that owns
+    it — ``main.py`` — handed in here as the ``register_session`` and
+    ``release_session`` callbacks.
+
+    Args:
+        apps: Extension the tools are added to.
+        get_session: Resolver for a download session id.
+        register_session: Adds a new session to the owning layer's registry.
+        release_session: Drops a session from the owning layer's registry.
+    """
+
+    @apps.tool(
+        resource_uri=PROGRESS_URI,
+        name="download_file",
+        title="Download one file",
+        description=(
+            "Download a single URL. PRIMARY download tool and the only one "
+            "needed for one file: it creates the session, queues the URL and "
+            "starts the transfer with a live progress bar in one call, so "
+            "never combine it with download_create_session, download_add or "
+            "download_start. url must be http or https on a host from "
+            "download_list_allowed_domains. destination_directory defaults to "
+            "%LOCALAPPDATA%\\MSH\\downloads and is created with its parents if "
+            "missing; a relative path resolves against this server's working "
+            "directory. filename overrides the name taken from the URL, with "
+            "any directory part of it stripped; max_retries is the total "
+            "attempts per file, 3 by default. Returns immediately with a "
+            "ticket carrying 'progress_id' (pass it only to "
+            "progress_get_status, progress_pause or progress_cancel), "
+            "'session_id' (generated, shaped 'auto-<8 hex>'; pass it only to "
+            "the download_* queue tools if the transfer needs pausing, "
+            "skipping or cancelling through them), 'destination' (the full "
+            "path the file is being written to, under the name actually "
+            "reserved), 'status' ('starting' — the first poll reports "
+            "'running') and 'next_step' (a ready-made hint naming both "
+            "identifiers). Those two identifiers are not interchangeable. "
+            "Never overwrites: when the destination name is already taken the "
+            "file is saved under a numbered variant, and 'destination' "
+            "reports the name actually used. A rejected domain or an unusable "
+            "directory fails before anything is queued or written."
+        ),
+        annotations=LONG_RUNNING,
+    )
+    @surface_core_errors
+    def download_file(
+        url: str,
+        destination_directory: str = str(DOWNLOADS_DIRECTORY),
+        filename: str | None = None,
+        max_retries: int = 3,
+    ) -> dict:
+        """Download one URL, creating and starting its session in one call.
+
+        Args:
+            url: HTTP or HTTPS URL on an allowed domain.
+            destination_directory: Directory the file is written into, created
+                if needed. Defaults to %LOCALAPPDATA%\MSH\downloads.
+            filename: Optional destination filename; taken from the URL when
+                omitted, and numbered if that name is already taken.
+            max_retries: Retry attempts before the transfer is marked failed.
+
+        Returns:
+            dict: A ticket carrying ``progress_id``, ``session_id``,
+            ``destination`` and ``status``.
+
+        Raises:
+            ToolError: If the session could not be created or the transfer
+                could not be started.
+        """
+        # The session is this tool's own bookkeeping, not something the caller
+        # named, so the id is generated. It is still returned, because the
+        # download_* tools act on a session and a caller may want to pause or
+        # cancel this one.
+        session_id = f"auto-{uuid4().hex[:8]}"
+
+        manager = DownloadManager(
+            download_directory=destination_directory,
+            max_retries=max_retries,
+        )
+        register_session(session_id, manager)
+
+        try:
+            manager.add(url=url, filename=filename)
+            job = workers.start_download(manager, session_id)
+        except Exception:
+            # A rejected domain or an unusable directory must not leave a
+            # session behind holding a queue nothing will ever run.
+            release_session(session_id)
+            raise
+
+        destination = _download_destination(manager, destination_directory)
+
+        return _started(
+            job,
+            session_id=session_id,
+            destination=destination,
+            next_step=(
+                f"Poll progress_get_status(progress_id='{job.id}') for "
+                f"progress, or download_get_status(session_id="
+                f"'{session_id}') for the queue's own view."
+            ),
+        )
 
     @apps.tool(
         resource_uri=PROGRESS_URI,
@@ -779,7 +915,7 @@ def _register_benchmarks(apps: Apps) -> None:
 
     @apps.tool(
         resource_uri=PROGRESS_URI,
-        name="ollama_run_benchmark",
+        name="benchmark_run",
         title="Run a benchmark matrix",
         description=(
             "Benchmark a matrix of models, configurations and prompts — the "
@@ -824,7 +960,7 @@ def _register_benchmarks(apps: Apps) -> None:
         annotations=LONG_RUNNING,
     )
     @surface_core_errors
-    def ollama_run_benchmark(
+    def benchmark_run(
         experiments: list[dict],
         shared_prompts: list[str] | None = None,
         include_output: bool = False,

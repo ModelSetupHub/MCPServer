@@ -32,7 +32,6 @@ import functools
 from pathlib import Path
 import threading
 from typing import Any, TypeVar
-from uuid import uuid4
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import MCPServerError, ToolError
@@ -52,11 +51,15 @@ except ImportError as error:
 from MSHCore import logging as core_logging  # noqa: E402
 from MSHCore.benchmark import history  # noqa: E402
 from MSHCore.system import hardware, scanner  # noqa: E402
+
+# The queue manager stays constructed here: the registry below holds its
+# instances and download_create_session builds one per named session.
 from MSHCore.download_manager.manager import DownloadManager  # noqa: E402
 
-# Where downloads land unless a tool call names somewhere else. Read from
-# MSHCore so this layer cannot disagree with the manager's own default: both are
-# %LOCALAPPDATA%\MSH\downloads, a per-user directory that needs no elevation.
+# Where a queue's downloads land unless a tool call names somewhere else. Read
+# from MSHCore so this layer cannot disagree with the manager's own default:
+# both are %LOCALAPPDATA%\MSH\downloads, a per-user directory needing no
+# elevation.
 from MSHCore.paths import DOWNLOADS_DIRECTORY  # noqa: E402
 
 DEFAULT_DOWNLOAD_DIRECTORY = str(DOWNLOADS_DIRECTORY)
@@ -69,14 +72,14 @@ from MSHCore.ollama import model, runtime  # noqa: E402
 from MSHCore.python import environment, installer, tools  # noqa: E402
 
 # The in-chat progress panel, the tools that draw it, and the plain tools that
-# read one afterwards. Every frontend file lives under gui/; this layer only hands
-# it a way to resolve a download session. `start_download` is the same worker the
-# panel's own tool uses, so the one-call facade below gets a progress bar too.
+# read one afterwards. Every frontend file lives under gui/; this layer hands it
+# the session registry's three operations, so the starting tools bound to the
+# panel — download_file and download_start — share the sessions the plain
+# download tools act on rather than keeping a registry of their own.
 from gui import (  # noqa: E402
     create_progress_app,
     note_download_ended,
     register_progress_tools,
-    start_download,
 )
 
 SERVER_NAME = "modelsetuphub"
@@ -96,7 +99,7 @@ restricted to a fixed domain whitelist.
   system_scan, which on Windows makes eight subprocess calls and can take
   tens of seconds — do not call it for a single number. system_scan reports
   memory and storage in GiB; the narrow tools report raw bytes.
-- Generate text: ollama_run_model. Measure speed: ollama_run_benchmark —
+- Generate text: ollama_run_model. Measure speed: benchmark_run —
   one model under several configurations, several models under one shared
   configuration, or any mix, as the experiments matrix. Only
   ollama_configure_model creates a persistent model variant; the benchmark
@@ -105,7 +108,7 @@ restricted to a fixed domain whitelist.
 - Several files as one unit of work: the session ceremony below.
 - Revisit a past benchmark: benchmark_list_history then
   benchmark_get_saved_result. Diagnose a failure: logs_read for anything
-  MSHCore did, list_ollama_logs then read_ollama_logs when Ollama itself is
+  MSHCore did, ollama_list_logs then ollama_read_log when Ollama itself is
   at fault.
 
 ## Single-call tools versus the download queue
@@ -137,8 +140,8 @@ three steps itself, so never pair it with them.
   one. Format: '<date>T<time>_<6 hex>'. A history id and a progress_id are
   never interchangeable.
 
-download_file returns the first two, and its progress_id is under the key
-'download_id'. Passing a session_id to progress_get_status reports
+download_file returns both, each under its own name — 'progress_id'
+and 'session_id'. Passing a session_id to progress_get_status reports
 found=false; passing a progress_id to a download_* tool reports an unknown
 session. Never call the starting tool again in order to obtain an id — the
 first call already returned it, and a second call starts a second operation.
@@ -149,13 +152,13 @@ Immediate: every read-only tool, and every download_* queue-control tool.
 
 Blocking until finished, with no progress reporting: ollama_run_model,
 ollama_start, ollama_stop, ollama_install, python_run_script,
-python_install_packages, python_create_environment and python_install_python.
+python_install_packages, python_create_environment and python_install_interpreter.
 Only ollama_start and ollama_stop take a timeout argument (15 and 10 seconds
 by default); the rest have none, several take minutes, and installers have no
 progress variant at all.
 
 Background, returning a progress_id at once: download_file, download_start
-and ollama_run_benchmark.
+and benchmark_run.
 Track them with progress_get_status(progress_id), which is a fast,
 non-blocking read of a recorded snapshot: status is 'starting' or 'running'
 while work continues, then 'completed', 'failed' or 'cancelled'. It answers
@@ -224,7 +227,7 @@ progress_id named in the error, or cancel it first.
 - On any failure, read logs_get_file_info, then logs_read with line_count set
   and level='ERROR' — a tool's error message is often shorter than the log
   entry behind it. For an Ollama service, model-load or GPU-detection failure,
-  call list_ollama_logs and then read_ollama_logs with a line range.
+  call ollama_list_logs and then ollama_read_log with a line range.
 
 Tools that delete models, environments, script files, packages, downloaded
 files, or saved benchmark runs are irreversible and annotated destructive.
@@ -434,22 +437,22 @@ def register_ollama_runtime_tools(server: MCPServer) -> None:
         return runtime.get_status()
 
     @server.tool(
-        name="list_ollama_logs",
+        name="ollama_list_logs",
         title="List Ollama log files",
         description=(
             "Index Ollama's own log files without reading their contents: the "
             "live app.log and server.log plus rotated app-N.log and "
             "server-N.log copies, from %LOCALAPPDATA%\\Ollama on Windows or "
             "~/.ollama/logs and /var/log/ollama elsewhere. Mandatory first "
-            "step before read_ollama_logs, because which names exist depends "
+            "step before ollama_read_log, because which names exist depends "
             "on how often Ollama has rotated its logs. Read-only. Returns one "
             "dict with exactly 'files' (list of {name, path, size_bytes, "
             "line_count, modified}, most recently modified first), "
             "'directories' (those actually searched) and 'total_bytes'. Use "
             "'size_bytes' and 'line_count' to plan pagination: "
-            "read_ollama_logs returns an entire file unless given a line "
+            "ollama_read_log returns an entire file unless given a line "
             "range, and server.log is often megabytes. 'line_count' is "
-            "counted exactly as read_ollama_logs numbers lines, so it can be "
+            "counted exactly as ollama_read_log numbers lines, so it can be "
             "passed straight back as end_line. Every file is read once to "
             "count lines, so this blocks in proportion to total log size. "
             "Fails when no Ollama log directory exists; returns an empty "
@@ -458,11 +461,11 @@ def register_ollama_runtime_tools(server: MCPServer) -> None:
         annotations=READ_ONLY,
     )
     @surface_core_errors
-    def list_ollama_logs() -> dict:
+    def ollama_list_logs() -> dict:
         return runtime.list_ollama_logs()
 
     @server.tool(
-        name="read_ollama_logs",
+        name="ollama_read_log",
         title="Read an Ollama log file",
         description=(
             "Read the contents of one Ollama log file. This is the diagnostic "
@@ -471,13 +474,13 @@ def register_ollama_runtime_tools(server: MCPServer) -> None:
             "— and it is server.log that records all three; app.log covers "
             "the desktop application. These are Ollama's logs; logs_read "
             "serves this project's own execution log instead. Requires a "
-            "prior list_ollama_logs call: file_name must be one bare name "
+            "prior ollama_list_logs call: file_name must be one bare name "
             "from its 'files' list, matched exactly and case-sensitively, "
             "never a path and never guessed. Read-only. PAGINATE: with no "
             "range the whole file is returned untruncated and server.log can "
             "be megabytes, which will overflow the context — pass start_line "
             "and end_line (1-based, inclusive on both ends, so 1..500 is 500 "
-            "lines) sized against the 'line_count' list_ollama_logs reported, "
+            "lines) sized against the 'line_count' ollama_list_logs reported, "
             "and prefer the smallest file covering the period of interest. "
             "The response carries 'total_lines' for the whole file plus the "
             "'start_line' and 'end_line' actually returned; 'end_line' is the "
@@ -489,7 +492,7 @@ def register_ollama_runtime_tools(server: MCPServer) -> None:
         annotations=READ_ONLY,
     )
     @surface_core_errors
-    def read_ollama_logs(
+    def ollama_read_log(
         file_name: str,
         start_line: int = 1,
         end_line: int | None = None,
@@ -497,7 +500,7 @@ def register_ollama_runtime_tools(server: MCPServer) -> None:
         """Read one Ollama log file, in full or a line range.
 
         Args:
-            file_name: Log file name from list_ollama_logs, for example
+            file_name: Log file name from ollama_list_logs, for example
                 'server.log' or 'app-2.log'.
             start_line: First line to return, 1-based. Defaults to the first.
             end_line: Last line to return, inclusive. Optional.
@@ -719,10 +722,10 @@ def register_ollama_model_tools(server: MCPServer) -> None:
             "Ollama service to be running and model_name to be installed, as "
             "printed by ollama_list_models. Single-shot: no conversation "
             "history is kept, so each call is independent, and generation "
-            "parameters cannot be set here — use ollama_run_benchmark to "
+            "parameters cannot be set here — use benchmark_run to "
             "vary them, or ollama_configure_model to bake them into a "
             "variant. Returns the generated text only, with no timings or "
-            "token counts; use ollama_run_benchmark when you need "
+            "token counts; use benchmark_run when you need "
             "measurements. Blocks "
             "for the whole generation with no timeout and no progress "
             "reporting, which for a large model or a long prompt can be "
@@ -871,7 +874,7 @@ def register_ollama_model_tools(server: MCPServer) -> None:
             "Create a new, separately named model from an existing one with "
             "Modelfile PARAMETER values baked in, for example temperature or "
             "num_ctx. Use this only when a persistent variant is wanted — for "
-            "trying parameters out, ollama_run_benchmark "
+            "trying parameters out, benchmark_run "
             "applies them per request and creates nothing. Requires the Ollama "
             "service to be running and source_model to be installed, as "
             "printed by ollama_list_models. source_model is left completely "
@@ -960,7 +963,7 @@ def register_ollama_model_tools(server: MCPServer) -> None:
 def register_benchmark_tools(server: MCPServer) -> None:
     """Register benchmark history tools.
 
-    The benchmark itself — ``ollama_run_benchmark`` — is the tracked tool
+    The benchmark itself — ``benchmark_run`` — is the tracked tool
     bound to the progress panel in ``gui.app``; only the history it saves
     its completed runs into is registered here as plain tools.
 
@@ -973,7 +976,7 @@ def register_benchmark_tools(server: MCPServer) -> None:
         title="List saved benchmark runs",
         description=(
             "List every benchmark run kept in the history, newest first. "
-            "Every completed background benchmark — ollama_run_benchmark — "
+            "Every completed background benchmark — benchmark_run — "
             "is saved here automatically, as is nothing else: the starting "
             "tool returns only a progress_id, no measurements. "
             "Read-only and cheap: the listing comes from a small index file, "
@@ -1082,13 +1085,13 @@ def register_python_tools(server: MCPServer) -> None:
     """
 
     @server.tool(
-        name="python_get_status",
+        name="python_list_versions",
         title="List installed Python versions",
         description=(
             "List the Python interpreters installed on this machine. Primary "
             "tool for discovering which versions are available before "
             "creating an environment or deciding whether "
-            "python_install_python is needed. No prerequisites. Read-only; "
+            "python_install_interpreter is needed. No prerequisites. Read-only; "
             "reads the Windows registry under HKLM and HKCU, so it makes no "
             "subprocess call and returns immediately. Returns a list of "
             "dicts, each with exactly 'version' and 'path' (the absolute "
@@ -1103,11 +1106,11 @@ def register_python_tools(server: MCPServer) -> None:
         annotations=READ_ONLY,
     )
     @surface_core_errors
-    def python_get_status() -> list[dict]:
+    def python_list_versions() -> list[dict]:
         return installer.get_python_status()
 
     @server.tool(
-        name="python_get_python_path",
+        name="python_resolve_path",
         title="Resolve interpreter path",
         description=(
             "Resolve the absolute path of the interpreter a given environment "
@@ -1125,7 +1128,7 @@ def register_python_tools(server: MCPServer) -> None:
         annotations=READ_ONLY,
     )
     @surface_core_errors
-    def python_get_python_path(env_path: str | None = None) -> str:
+    def python_resolve_path(env_path: str | None = None) -> str:
         """Resolve an interpreter path.
 
         Args:
@@ -1148,7 +1151,7 @@ def register_python_tools(server: MCPServer) -> None:
             "than overwriting anything, so an existing environment is never "
             "disturbed. The environment always uses the interpreter running "
             "this server; there is no way to select a version here, so check "
-            "python_get_status first if a specific version matters. Blocks "
+            "python_list_versions first if a specific version matters. Blocks "
             "while venv runs, with no timeout and no progress reporting. "
             "Returns the created environment's absolute path as a string, "
             "which is the value to reuse as env_path."
@@ -1182,7 +1185,7 @@ def register_python_tools(server: MCPServer) -> None:
             "verify that the target is a virtual environment — any existing "
             "directory path given here is destroyed, so confirm env_path is "
             "the environment you mean, ideally by resolving it first with "
-            "python_get_python_path. env_path is the environment directory as "
+            "python_resolve_path. env_path is the environment directory as "
             "returned by python_create_environment. Fails when the path does "
             "not exist. A failure part-way through, for example a locked file "
             "on Windows, can leave the tree partly deleted. Blocks for the "
@@ -1508,7 +1511,7 @@ def register_python_tools(server: MCPServer) -> None:
         return tools.run_script(path=path, environment=env_path)
 
     @server.tool(
-        name="python_install_python",
+        name="python_install_interpreter",
         title="Install Python from an installer",
         description=(
             "Install a Python interpreter by executing a Windows installer "
@@ -1523,8 +1526,8 @@ def register_python_tools(server: MCPServer) -> None:
             "them the installer exits non-zero and the call fails. Blocks "
             "until the installer exits, with no timeout and no progress "
             "variant to poll. Returns the same list of 'version'/'path' dicts "
-            "as python_get_status, re-detected afterwards; compare it against "
-            "a python_get_status call made before the install to confirm a "
+            "as python_list_versions, re-detected afterwards; compare it against "
+            "a python_list_versions call made before the install to confirm a "
             "new version actually appeared, since the installer's own output "
             "is not returned."
         ),
@@ -1536,7 +1539,7 @@ def register_python_tools(server: MCPServer) -> None:
         ),
     )
     @surface_core_errors
-    def python_install_python(
+    def python_install_interpreter(
         installer_path: str,
         all_users: bool = False,
     ) -> list[dict]:
@@ -1568,7 +1571,10 @@ CANCEL_WAIT_SECONDS = 60.0
 # polled while a background thread downloads. MCP tool calls are individually
 # stateless, so named manager instances are kept here and each tool acts on one
 # by session_id. This registry is the only state this layer adds; queueing,
-# retrying, resuming, and progress tracking all stay in MSHCore.
+# retrying, resuming, and progress tracking all stay in MSHCore. The registry's
+# three operations — look up, add, remove — are what the gui layer's starting
+# tools receive, so a session opened by download_file on the panel is the same
+# object the plain download tools act on.
 #
 # A cancelled session is dropped from the registry as part of the cancellation,
 # not left behind in a cancelled state: its queue and files are gone, so keeping
@@ -1576,6 +1582,17 @@ CANCEL_WAIT_SECONDS = 60.0
 # original URLs and start the same transfer twice.
 _sessions: dict[str, DownloadManager] = {}
 _sessions_lock = threading.Lock()
+
+
+def _register_session(session_id: str, manager: DownloadManager) -> None:
+    """Add a new session to the registry.
+
+    Args:
+        session_id: Identifier for the session, generated or caller-chosen.
+        manager: Manager instance the session id names.
+    """
+    with _sessions_lock:
+        _sessions[session_id] = manager
 
 
 def _get_session(session_id: str) -> DownloadManager:
@@ -1640,30 +1657,6 @@ def _discard_session(session_id: str) -> dict | None:
     return status
 
 
-def _download_destination(
-    manager: DownloadManager,
-    directory: str,
-) -> str | None:
-    """Report the path the single queued file is being written to.
-
-    MSHCore may rename a file to avoid overwriting one already on disk, so the
-    name is read back from the queue rather than assumed from the URL.
-
-    Args:
-        manager: Manager holding the one-file queue.
-        directory: Directory the session writes into.
-
-    Returns:
-        str | None: Full path to the file, or None when the queue is empty.
-    """
-    downloads = manager.get_status()["downloads"]
-
-    if not downloads:
-        return None
-
-    return str(Path(directory) / downloads[0]["filename"])
-
-
 def register_download_tools(server: MCPServer) -> None:
     """Register download queue tools.
 
@@ -1691,100 +1684,6 @@ def register_download_tools(server: MCPServer) -> None:
     @surface_core_errors
     def download_list_allowed_domains() -> list[str]:
         return allowed_sources()
-
-    @server.tool(
-        name="download_file",
-        title="Download one file",
-        description=(
-            "Download a single URL. PRIMARY download tool and the only one "
-            "needed for one file: it creates the session, queues the URL and "
-            "starts the transfer with a live progress bar in one call, so "
-            "never combine it with download_create_session, download_add or "
-            "download_start. url must be http or https on a host from "
-            "download_list_allowed_domains. destination_directory defaults to "
-            "%LOCALAPPDATA%\\MSH\\downloads and is created with its parents if "
-            "missing; a relative path resolves against this server's working "
-            "directory. filename overrides the name taken from the URL, with "
-            "any directory part of it stripped; max_retries is the total "
-            "attempts per file, 3 by default. Returns immediately with a "
-            "ticket carrying 'download_id' (a progress_id — pass it only to "
-            "progress_get_status, progress_pause or progress_cancel), "
-            "'session_id' (generated, shaped 'auto-<8 hex>'; pass it only to "
-            "the download_* queue tools if the transfer needs pausing, "
-            "skipping or cancelling through them), 'destination' (the full "
-            "path the file is being written to, under the name actually "
-            "reserved), 'status' (always 'running' in this response) and "
-            "'next_step' (a ready-made hint naming both identifiers). Those "
-            "two identifiers are not interchangeable. Never overwrites: "
-            "when the destination name is already taken the file is saved "
-            "under a numbered variant, and 'destination' reports the name "
-            "actually used. A rejected domain or an unusable directory fails "
-            "before anything is queued or written."
-        ),
-        annotations=ToolAnnotations(
-            read_only_hint=False,
-            destructive_hint=False,
-            idempotent_hint=False,
-            open_world_hint=True,
-        ),
-    )
-    @surface_core_errors
-    def download_file(
-        url: str,
-        destination_directory: str = DEFAULT_DOWNLOAD_DIRECTORY,
-        filename: str | None = None,
-        max_retries: int = 3,
-    ) -> dict:
-        """Download one URL, creating and starting its session in one call.
-
-        Args:
-            url: HTTP or HTTPS URL on an allowed domain.
-            destination_directory: Directory the file is written into, created
-                if needed. Defaults to %LOCALAPPDATA%\\MSH\\downloads.
-            filename: Optional destination filename; taken from the URL when
-                omitted, and numbered if that name is already taken.
-            max_retries: Retry attempts before the transfer is marked failed.
-
-        Returns:
-            dict: A ticket carrying ``download_id``, ``session_id``,
-            ``destination`` and ``status``.
-        """
-        # The session is this tool's own bookkeeping, not something the caller
-        # named, so the id is generated. It is still returned, because the
-        # download_* tools act on a session and a caller may want to pause or
-        # cancel this one.
-        session_id = f"auto-{uuid4().hex[:8]}"
-
-        manager = DownloadManager(
-            download_directory=destination_directory,
-            max_retries=max_retries,
-        )
-
-        with _sessions_lock:
-            _sessions[session_id] = manager
-
-        try:
-            manager.add(url=url, filename=filename)
-            job = start_download(manager, session_id)
-        except Exception:
-            # A rejected domain or an unusable directory must not leave a
-            # session behind holding a queue nothing will ever run.
-            _discard_session(session_id)
-            raise
-
-        destination = _download_destination(manager, destination_directory)
-
-        return {
-            "download_id": job.id,
-            "session_id": session_id,
-            "destination": destination,
-            "status": "running",
-            "next_step": (
-                f"Poll progress_get_status(progress_id='{job.id}') for "
-                f"progress, or download_get_status(session_id="
-                f"'{session_id}') for the queue's own view."
-            ),
-        }
 
     @server.tool(
         name="download_create_session",
@@ -2254,7 +2153,7 @@ def register_logging_tools(server: MCPServer) -> None:
             "writes for every significant operation. PRIMARY diagnostic tool "
             "after any failure: a tool's error message is often shorter than "
             "the log entry behind it. This is MSHCore's own log; "
-            "read_ollama_logs serves Ollama's separate log files, which are "
+            "ollama_read_log serves Ollama's separate log files, which are "
             "where an Ollama service, model-load or GPU-detection failure is "
             "explained. No prerequisites, though logs_get_file_info first "
             "tells you how large the log is. Read-only. Returns a list of "
@@ -2359,13 +2258,14 @@ def create_server() -> MCPServer:
         version=SERVER_VERSION,
         # The progress panel is an additive MCP Apps extension: it contributes the
         # ui:// resource and the tools bound to it, and intercepts nothing. The
-        # session resolver and remover are passed in so the download registry
-        # above stays the single place sessions live — including when the panel's
-        # Cancel button is what ended one.
+        # session registry's three operations are handed over so the starting
+        # tools bound to the panel — download_file and download_start — act on
+        # the same sessions the plain download tools do.
         extensions=[
             create_progress_app(
                 get_session=_get_session,
                 release_session=_discard_session,
+                register_session=_register_session,
             )
         ],
     )
