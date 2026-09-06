@@ -956,20 +956,23 @@ def _register_benchmarks(apps: Apps) -> None:
         name="benchmark_run",
         title="Run a benchmark matrix",
         description=(
-            "Benchmark a matrix of models, configurations and prompts — the "
-            "one benchmark tool, covering everything from a single model "
-            "under one configuration to a full cross-model comparison — "
-            "running it in the background and showing a live progress bar in "
-            "the conversation with one row per model-configuration pair (one "
-            "row per prompt for the single pair). experiments is a list of "
-            "dicts, one per model in run order: 'model' (required) and "
-            "'configurations' (optional; each a dict with 'name', 'options' "
-            "and an optional 'prompts' list only that configuration answers). "
-            "A configuration without 'name' is listed under "
-            "'configuration_<position>' and one without 'options' runs "
-            "Ollama's defaults. Every configuration answers shared_prompts "
-            "before its own; a model with no configurations runs once under "
-            "its defaults. include_output defaults to false and keeps only "
+            "Benchmark a matrix of models and configurations over a shared "
+            "prompt list — the one benchmark tool, covering everything from "
+            "a single model under one configuration to a full cross-model "
+            "comparison — running it in the background and showing a live "
+            "progress bar in the conversation with one row per "
+            "model-configuration pair (one row per prompt for the single "
+            "pair). Rows are weighted by the work they carry — the prompts "
+            "each pair answers — so the bar keeps step with the run. "
+            "experiments is a list of dicts, one per model in run order: "
+            "'model' (required) and 'configurations' (optional; each a dict "
+            "with 'name' and 'options'). A configuration without 'name' is "
+            "listed under 'configuration_<position>' and one without "
+            "'options' runs Ollama's defaults. Every configuration answers "
+            "the same shared_prompts — one prompt list for the whole matrix, "
+            "which is what makes the numbers comparable; a model with no "
+            "configurations runs once under its defaults. include_output "
+            "defaults to false and keeps only "
             "measurements — pass true to keep each prompt's generated text "
             "in the result. One "
             "model carrying several configurations compares parameter sets; "
@@ -1000,7 +1003,7 @@ def _register_benchmarks(apps: Apps) -> None:
     @surface_core_errors
     def benchmark_run(
         experiments: list[dict],
-        shared_prompts: list[str] | None = None,
+        shared_prompts: list[str],
         include_output: bool = False,
         repetitions: int = 1,
     ) -> dict:
@@ -1010,7 +1013,7 @@ def _register_benchmarks(apps: Apps) -> None:
             experiments: One dict per model, shaped as
                 {"model": "llama3", "configurations": [{"name": "warm",
                 "options": {"temperature": 0.9}}]}.
-            shared_prompts: Prompts every configuration answers.
+            shared_prompts: The prompts every configuration answers.
             include_output: Whether to keep generated text alongside metrics.
             repetitions: How many times every prompt runs per configuration,
                 from 1.
@@ -1020,9 +1023,9 @@ def _register_benchmarks(apps: Apps) -> None:
 
         Raises:
             ToolError: If no experiment was given, or one is malformed, or
-                the matrix names no prompts at all. Checked here because the
-                worker runs after this returns, so a bad argument would
-                otherwise surface only on the progress bar.
+                shared_prompts is not a non-empty list of strings. Checked
+                here because the worker runs after this returns, so a bad
+                argument would otherwise surface only on the progress bar.
         """
         experiments = _normalise_experiments(experiments, shared_prompts)
 
@@ -1036,8 +1039,10 @@ def _register_benchmarks(apps: Apps) -> None:
         return _benchmark_started(
             job,
             models=sorted({experiment["model"] for experiment in experiments}),
+            # An experiment without 'configurations' still runs one pair —
+            # its model under Ollama's defaults — so it counts as one.
             configurations=sum(
-                len(experiment["configurations"])
+                len(experiment.get("configurations") or []) or 1
                 for experiment in experiments
             ),
         )
@@ -1119,33 +1124,39 @@ def _register_models(apps: Apps) -> None:
 
 def _normalise_experiments(
     experiments: list[dict],
-    shared_prompts: list[str] | None,
+    shared_prompts: list[str],
 ) -> list[dict]:
     """Validate the matrix before the worker starts.
 
     MSHCore normalises and validates these itself, but it does so on the worker
     thread — after the tool has returned. Doing it here means a malformed
-    experiment is a tool error the model can act on, and a matrix that names
-    no prompts fails now rather than as a failed progress bar.
+    experiment is a tool error the model can act on, and a matrix with no
+    shared prompts fails now rather than as a failed progress bar. Prompts are
+    shared by design — one list for the whole matrix is what keeps the
+    configurations' numbers comparable — so a configuration carrying a
+    'prompts' key of its own is rejected outright.
 
     Args:
         experiments: Experiments as given to the tool.
-        shared_prompts: Prompts every configuration answers, for checking
-            that each configuration ends up with work to do.
+        shared_prompts: The prompts every configuration answers.
 
     Returns:
         list[dict]: The experiments as given, verified.
 
     Raises:
-        ToolError: If the list is empty or an entry is not usable.
+        ToolError: If the list is empty, an entry is not usable, or
+            shared_prompts is not a non-empty list of strings.
     """
     if not isinstance(experiments, list) or not experiments:
         raise ToolError("At least one experiment is required.")
 
-    if shared_prompts is not None and (
-        not isinstance(shared_prompts, list)
-        or not all(isinstance(prompt, str) for prompt in shared_prompts)
-    ):
+    if not isinstance(shared_prompts, list) or not shared_prompts:
+        raise ToolError(
+            "shared_prompts is required: every configuration answers the "
+            "same prompt list."
+        )
+
+    if not all(isinstance(prompt, str) for prompt in shared_prompts):
         raise ToolError("shared_prompts must be a list of strings.")
 
     for position, experiment in enumerate(experiments, start=1):
@@ -1160,13 +1171,6 @@ def _normalise_experiments(
         configurations = experiment.get("configurations")
 
         if configurations is None:
-            if not shared_prompts:
-                raise ToolError(
-                    f"Experiment '{model}' has nothing to run: give "
-                    f"shared_prompts, or configurations with 'prompts' of "
-                    f"their own."
-                )
-
             continue
 
         if not isinstance(configurations, list) or not configurations:
@@ -1189,21 +1193,11 @@ def _normalise_experiments(
                     f"object."
                 )
 
-            prompts = configuration.get("prompts")
-
-            if prompts is not None and (
-                not isinstance(prompts, list)
-                or not all(isinstance(prompt, str) for prompt in prompts)
-            ):
+            if "prompts" in configuration:
                 raise ToolError(
-                    f"Configuration {index} of '{model}' prompts must be a "
-                    f"list of strings."
-                )
-
-            if not prompts and not shared_prompts:
-                raise ToolError(
-                    f"Configuration {index} of '{model}' has nothing to run: "
-                    f"give shared_prompts, or a 'prompts' list of its own."
+                    f"Configuration {index} of '{model}' carries 'prompts', "
+                    f"but prompts are shared across every configuration: "
+                    f"pass them as shared_prompts instead."
                 )
 
     return experiments

@@ -26,7 +26,7 @@ from __future__ import annotations
 from collections.abc import Callable
 import threading
 import time
-from typing import Any
+from typing import Any, NamedTuple
 
 # MSHCore is installed with pip and imported as a top-level package, the same
 # way the server's other modules import it. Mixing spellings — say, `MSHCore.x`
@@ -398,6 +398,78 @@ def note_download_ended(session_id: str, reason: str) -> bool:
 # Benchmarks
 # ============================================================
 
+class _Pair(NamedTuple):
+    """One model-configuration pair of a matrix, with its prompt count.
+
+    The positions are the 1-based ones MSHCore's progress steps carry back —
+    ``model_index`` names the experiment, ``configuration_index`` the
+    configuration within it — so a step can be routed to its row even when
+    two pairs are named alike.
+    """
+
+    model_position: int
+    configuration_position: int
+    model: str
+    name: str
+    prompts: int
+
+
+def _matrix_plan(
+    experiments: list[dict],
+    shared_prompts: list[str] | None,
+) -> list[_Pair]:
+    """Plan a matrix's model-configuration pairs the way MSHCore runs them.
+
+    Mirrors the normalisation in ``ollama_runner.run_benchmark``: a model
+    with no configurations runs once under 'default', and an unnamed
+    configuration takes its position. Every pair answers the same
+    ``shared_prompts``, so all their prompt counts are one — the count is
+    still carried per pair, because MSHCore is the authority on what a pair
+    will run and the plan only mirrors it.
+
+    Args:
+        experiments: The matrix as given to the worker.
+        shared_prompts: The prompts every configuration answers.
+
+    Returns:
+        list[_Pair]: One entry per pair, in run order, each carrying the
+        number of prompts its run_test will execute.
+    """
+    shared = len(shared_prompts or [])
+
+    plan: list[_Pair] = []
+
+    for model_position, experiment in enumerate(experiments, start=1):
+        model = experiment["model"]
+        configurations = experiment.get("configurations")
+
+        if configurations is None:
+            plan.append(
+                _Pair(model_position, 1, model, "default", shared)
+            )
+            continue
+
+        for configuration_position, configuration in enumerate(
+            configurations, start=1
+        ):
+            if isinstance(configuration, dict):
+                name = configuration.get("name")
+            else:
+                name = None
+
+            plan.append(
+                _Pair(
+                    model_position,
+                    configuration_position,
+                    model,
+                    name if isinstance(name, str) and name else f"configuration_{configuration_position}",
+                    shared,
+                )
+            )
+
+    return plan
+
+
 def start_benchmark(
     experiments: list[dict],
     shared_prompts: list[str] | None,
@@ -407,27 +479,26 @@ def start_benchmark(
     """Begin a benchmark matrix and run it on a worker thread.
 
     Calls ``ollama_runner.run_benchmark``, so MSHCore normalises the matrix
-    and this layer has one result shape to classify. One row is created per
-    model-configuration pair before MSHCore runs — one row per prompt
-    instead when the matrix is a single pair, so the panel shows the shape
-    of the work rather than an empty indeterminate bar.
+    and this layer has one result shape to classify. The rows are laid out
+    from the same normalisation before MSHCore runs — one row per
+    model-configuration pair, weighted by the prompts that pair will answer,
+    so the bar moves in step with the work whatever the matrix's shape. Only
+    when the matrix is a single pair do the rows become the prompts
+    themselves, each advancing repetition by repetition.
 
     Args:
         experiments: One dict per model, in run order: 'model' plus optional
-            'configurations', each carrying 'name', 'options' and an optional
-            'prompts' list only that configuration answers.
-        shared_prompts: Prompts every configuration answers before its own,
-            or None when every configuration carries its own.
+            'configurations', each carrying 'name' and 'options'.
+        shared_prompts: The prompts every configuration answers.
         include_output: Whether to include generated text in the results.
         repetitions: How many times every prompt runs per configuration, from 1.
 
     Returns:
         Job: The job, already persisted, whose id the panel polls.
     """
-    prompts = list(shared_prompts or [])
-    pairs = _matrix_pairs(experiments)
+    pairs = _matrix_plan(experiments, shared_prompts)
     models = _matrix_models(experiments)
-    single = len(pairs) == 1 and bool(prompts)
+    single = len(pairs) == 1 and pairs[0].prompts > 0
 
     job = Job(
         kind="benchmark",
@@ -437,22 +508,32 @@ def start_benchmark(
             else f"Comparing {len(models)} model(s)"
         ),
         message=(
-            f"{len(prompts)} prompt(s) · {pairs[0][1]}"
+            f"{pairs[0].prompts} prompt(s) · {pairs[0].name}"
             if single
-            else f"{len(pairs)} configuration(s) · {len(prompts)} prompt(s) each"
+            else (
+                f"{len(pairs)} configuration(s) · "
+                f"{sum(pair.prompts for pair in pairs)} prompt run(s) in total"
+            )
         ),
     )
 
     # The rows exist before MSHCore runs, so the very first poll shows the shape of
-    # the work rather than an empty indeterminate bar.
+    # the work rather than an empty indeterminate bar. Every pair's weight is the
+    # number of prompt repetitions it will run, so a configuration carrying more
+    # prompts — or a longer queue of shared ones — owns a proportionally larger
+    # share of the bar.
     if single:
-        job.add_steps([f"prompt {index}" for index in range(1, len(prompts) + 1)])
+        job.add_steps([f"prompt {index}" for index in range(1, pairs[0].prompts + 1)])
     else:
+        # One call per pair: add_steps weights every step it is given alike,
+        # and the point here is that the pairs are not alike.
         multi_model = len(models) > 1
-        job.add_steps(
-            [_pair_label(model, name, multi_model) for model, name in pairs],
-            weight=float(len(prompts) or 1),
-        )
+
+        for pair in pairs:
+            job.add_steps(
+                [_pair_label(pair.model, pair.name, multi_model)],
+                weight=float(max(pair.prompts, 1) * repetitions),
+            )
 
     token = CancellationToken()
     job.set_cancel(token.cancel)
@@ -460,15 +541,13 @@ def start_benchmark(
     def run(cancellation: CancellationToken) -> dict:
         return ollama_runner.run_benchmark(
             experiments=experiments,
-            shared_prompts=shared_prompts or None,
+            shared_prompts=shared_prompts,
             include_output=include_output,
             cancellation=cancellation,
             repetitions=repetitions,
             on_progress=_on_progress(
                 job,
-                rows=None
-                if single
-                else {(model, name): index for index, (model, name) in enumerate(pairs)},
+                plan=None if single else pairs,
             ),
         )
 
@@ -484,45 +563,6 @@ def start_benchmark(
     )
 
     return job
-
-
-def _matrix_pairs(experiments: list[dict]) -> list[tuple[str, str]]:
-    """List the model-configuration pairs a matrix will run, in run order.
-
-    Mirrors MSHCore's own normalisation so the rows can be named before it
-    runs: a model with no configurations runs once under 'default', and a
-    configuration without a name takes its position.
-
-    Args:
-        experiments: The matrix as given to the worker.
-
-    Returns:
-        list[tuple[str, str]]: One (model, configuration name) per pair.
-    """
-    pairs: list[tuple[str, str]] = []
-
-    for experiment in experiments:
-        model = experiment["model"]
-        configurations = experiment.get("configurations")
-
-        if configurations is None:
-            pairs.append((model, "default"))
-            continue
-
-        for index, configuration in enumerate(configurations, start=1):
-            name = (
-                configuration.get("name")
-                if isinstance(configuration, dict)
-                else None
-            )
-            pairs.append(
-                (
-                    model,
-                    name if isinstance(name, str) and name else f"configuration_{index}",
-                )
-            )
-
-    return pairs
 
 
 def _matrix_models(experiments: list[dict]) -> list[str]:
@@ -569,30 +609,44 @@ def _pair_label(model: str, name: str, multi_model: bool) -> str:
 
 def _on_progress(
     job: Job,
-    rows: dict[tuple[str, str], int] | None,
+    plan: list[_Pair] | None,
 ) -> Callable[[dict], None]:
     """Build the callback MSHCore invokes as a benchmark's steps advance.
 
     MSHCore calls it once before every prompt and once after every finished
     repetition, with a dict carrying which model and configuration (name and
-    position of each), which prompt and repetition, how many of both, and how
-    many steps the whole run has completed and will run in total. It carries no
-    success information: a failed repetition is indistinguishable from a
-    finished one here, so every row the callback closes is provisional and
-    ``_close_benchmark_steps`` rewrites the states from the result afterwards.
-    MSHCore already absorbs callback failures — an exception is logged and
-    dropped rather than raised into the run — so this reshaping adds no
-    guarding of its own.
+    1-based position of each), which prompt and repetition, how many of both,
+    and how many steps the whole run has completed and will run in total. It
+    carries no success information: a failed repetition is indistinguishable
+    from a finished one here, so every row the callback closes is provisional
+    and ``_close_benchmark_steps`` rewrites the states from the result
+    afterwards. MSHCore already absorbs callback failures — an exception is
+    logged and dropped rather than raised into the run — so this reshaping
+    adds no guarding of its own.
+
+    A step is routed to its row by the step's (model_index,
+    configuration_index) positions rather than by names: one matrix can carry
+    two configurations named alike — two models' defaults, say, or one model
+    listed twice — and only the positions never collide.
 
     Args:
         job: Job whose rows the callback keeps current.
-        rows: (model, configuration name) to row index, for a matrix. None
-            when the rows are prompts of a single test, which the prompt
-            index addresses directly.
+        plan: The matrix's pairs, in run order, for a matrix. None when the
+            rows are prompts of a single pair, which the prompt index
+            addresses directly.
 
     Returns:
         Callable[[dict], None]: The callback to hand to MSHCore.
     """
+    rows = (
+        None
+        if plan is None
+        else {
+            (pair.model_position, pair.configuration_position): index
+            for index, pair in enumerate(plan)
+        }
+    )
+
     def on_progress(step: dict) -> None:
         index = step.get("prompt_index")
 
@@ -607,8 +661,11 @@ def _on_progress(
         if rows is None:
             if starting:
                 job.start_step(index - 1, detail="running")
+                job.update_step(index - 1, percent=_prompt_percent(step))
             elif last_repetition:
                 job.finish_step(index - 1, state=COMPLETED)
+            else:
+                job.update_step(index - 1, percent=_prompt_percent(step))
 
             # Same persistence duty as the matrix path below: the callback is
             # the only thing moving this benchmark's rows.
@@ -616,8 +673,9 @@ def _on_progress(
 
             return
 
-        key = (step.get("model"), step.get("configuration"))
-        row = rows.get(key)
+        row = rows.get(
+            (step.get("model_index"), step.get("configuration_index"))
+        )
 
         if row is None:
             return
@@ -625,9 +683,16 @@ def _on_progress(
         job.start_step(row)
         job.update_step(row, percent=_row_percent(step))
 
-        if not starting and last_repetition:
-            # The configuration's last repetition just finished. The row still
-            # reads completed even when prompts failed — the result settles it.
+        if (
+            not starting
+            and last_repetition
+            and index == step.get("prompt_count")
+        ):
+            # The configuration's final repetition just finished. A prompt's
+            # last repetition before that leaves the row running at its
+            # fraction — the repetition counts in a step are the current
+            # prompt's, not the configuration's. The row still reads
+            # completed even when prompts failed — the result settles it.
             job.finish_step(row, state=COMPLETED)
 
         # The rows advance from this callback alone, so persisting here is what
@@ -638,8 +703,40 @@ def _on_progress(
     return on_progress
 
 
+def _prompt_percent(step: dict) -> float | None:
+    """Derive the running prompt's own percentage from one progress step.
+
+    A single-pair benchmark's rows are its prompts, so the running row
+    advances within itself as its repetitions go by — a prompt_start has run
+    nothing yet and reads zero, whatever number the prompt is in the queue.
+
+    Args:
+        step: Progress dict MSHCore emitted.
+
+    Returns:
+        float | None: Percent complete for the step's prompt, or None when
+        the counts are missing or unusable.
+    """
+    repetition = step.get("repetition")
+    repetition_count = step.get("repetition_count")
+
+    if not isinstance(repetition, int) or not isinstance(
+        repetition_count, int
+    ):
+        return None
+
+    if repetition_count <= 0 or repetition < 0:
+        return None
+
+    return 100.0 * min(repetition, repetition_count) / repetition_count
+
+
 def _row_percent(step: dict) -> float | None:
-    """Derive a comparison row's percentage from one progress step.
+    """Derive a configuration row's percentage from one progress step.
+
+    The step's repetition figures belong to the prompt it names, so the
+    fraction is the prompts finished before it plus the repetitions it has
+    itself completed, over the pair's whole prompt-repetition count.
 
     Args:
         step: Progress dict MSHCore emitted.
@@ -790,6 +887,9 @@ def _close_benchmark_steps(job: Job, result: dict, single: bool) -> None:
             job.finish_step(
                 index,
                 state=FAILED if entry.get("success") is False else COMPLETED,
+                # Retires the "running" the callback left on the row; the
+                # panel falls back to the state word.
+                detail=None if entry.get("success") is False else "done",
                 error=entry.get("error"),
             )
 
@@ -800,7 +900,9 @@ def _close_benchmark_steps(job: Job, result: dict, single: bool) -> None:
         return
 
     # One row per configuration, in the order they were queued — which is the
-    # order MSHCore runs and returns them in.
+    # order MSHCore runs and returns them in. A test's result entries are per
+    # prompt — its repetitions are averaged away inside them — so the count a
+    # row closes under is prompts answered, not generations run.
     for index in range(job.step_count()):
         if index >= len(tests):
             job.finish_step(index, state=SKIPPED, detail="not run")
@@ -812,7 +914,7 @@ def _close_benchmark_steps(job: Job, result: dict, single: bool) -> None:
         job.finish_step(
             index,
             state=FAILED if entries and failed == len(entries) else COMPLETED,
-            detail=f"{len(entries)}/{len(entries)}",
+            detail=f"{len(entries) - failed} of {len(entries)} prompt(s)",
         )
 
 
