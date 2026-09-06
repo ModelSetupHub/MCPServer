@@ -839,7 +839,7 @@ def register_ollama_model_tools(server: MCPServer) -> None:
         return model.stop_model(model=model_name)
 
     @server.tool(
-        name="delete_model_file",
+        name="ollama_delete_model_file",
         title="Delete a model weights file",
         description=(
             "Delete one model weights file from disk — the .gguf a manual "
@@ -866,7 +866,7 @@ def register_ollama_model_tools(server: MCPServer) -> None:
         ),
     )
     @surface_core_errors
-    def delete_model_file(model_path: str) -> str:
+    def ollama_delete_model_file(model_path: str) -> str:
         """Delete a GGUF model weights file from disk.
 
         Args:
