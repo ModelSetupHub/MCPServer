@@ -15,7 +15,7 @@ are conditions on the reader's side, and none of them is a state a job can be in
 Every change persists the whole snapshot to disk — under
 ``%LOCALAPPDATA%\\MSH\\progress``, a folder that holds progress information
 only — which is the source of truth. A benchmark's measurements are kept
-apart, in the benchmark history (``MSHCore.benchmark.history``, under
+apart, in the benchmark history (``MSHCore.benchmarks.history``, under
 ``benchmarks\\``), with the snapshot carrying only that entry's identifier.
 The registry below is a runtime cache: it exists so a Cancel
 button has an object to call, and so a reader mid-operation does not have to wait
@@ -38,7 +38,7 @@ import time
 from typing import Any, Callable
 import uuid
 
-from MSHCore.benchmark import history
+from MSHCore.benchmarks import history
 from MSHCore.paths import app_data_directory
 
 STARTING = "starting"
@@ -176,7 +176,7 @@ def save_job_result(result: dict) -> str | None:
 
     Args:
         result: A comparison result carrying ``tests`` and a ``models`` list,
-            as ``ollama_runner.run_benchmark`` returned it.
+            as the MSHCore benchmark modes return it.
 
     Returns:
         str | None: The identifier the history entry was stored under, or None

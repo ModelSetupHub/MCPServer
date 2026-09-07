@@ -49,7 +49,7 @@ except ImportError as error:
     ) from error
 
 from MSHCore import logging as core_logging  # noqa: E402
-from MSHCore.benchmark import history  # noqa: E402
+from MSHCore.benchmarks import history  # noqa: E402
 from MSHCore.system import hardware, scanner  # noqa: E402
 
 # The queue manager stays constructed here: the registry below holds its
@@ -99,11 +99,14 @@ restricted to a fixed domain whitelist.
   system_scan, which on Windows makes eight subprocess calls and can take
   tens of seconds — do not call it for a single number. system_scan reports
   memory and storage in GiB; the narrow tools report raw bytes.
-- Generate text: ollama_run_model. Measure speed: benchmark_run —
-  one model under several configurations, several models under one shared
-  configuration, or any mix, as the experiments matrix. Only
-  ollama_configure_model creates a persistent model variant; the benchmark
-  tool applies parameters per request and creates nothing.
+- Generate text: ollama_run_model. Measure speed: the four Ollama benchmark
+  tools, one per Benchmark Mode — benchmark_ollama_single for one model's raw
+  speed, benchmark_ollama_configs to compare parameter sets on one model,
+  benchmark_ollama_models to compare models under one shared configuration,
+  and benchmark_ollama_tournament when each model races its own paired
+  configuration. Only ollama_configure_model creates a persistent model
+  variant; the benchmark tools apply parameters per request and create
+  nothing.
 - Adopt a local weights file: ollama_add_model, which imports it in the
   background under a minimal status badge and returns a progress_id.
 - One file from the web: download_file, the primary download tool.
@@ -163,7 +166,8 @@ ollama_add_model is tracked and reports a progress bar, so it runs in the
 background instead.
 
 Background, returning a progress_id at once: download_file, download_start,
-benchmark_run and ollama_add_model.
+the four benchmark_ollama_* tools (single, configs, models and tournament)
+and ollama_add_model.
 Track them with progress_get_status(progress_id), which is a fast,
 non-blocking read of a recorded snapshot: status is 'starting' or 'running'
 while work continues, then 'completed', 'failed' or 'cancelled'. It answers
@@ -198,8 +202,13 @@ The kinds differ in what waking up means:
   reach it again in any later conversation. Every background comparison also
   carries a two-way 'significance' assessment: 'by_model' judges each model's
   configurations against each other, 'across_models' judges the models against
-  each other. A verdict's 'significant' is a real true/false when repetitions
-  ran above 1, null when each prompt was measured once.
+  each other. Which half answers your question follows from the mode you ran:
+  benchmark_ollama_configs is judged by 'by_model', benchmark_ollama_models
+  and benchmark_ollama_tournament by 'across_models' (tournament also gets a
+  per-model look when a model carries several configurations), and
+  benchmark_ollama_single has nothing to rank. A verdict's 'significant' is a
+  real true/false when repetitions ran above 1, null when each prompt was
+  measured once.
 
 ## Controlling a running operation
 
@@ -732,10 +741,10 @@ def register_ollama_model_tools(server: MCPServer) -> None:
             "Ollama service to be running and model_name to be installed, as "
             "printed by ollama_list_models. Single-shot: no conversation "
             "history is kept, so each call is independent, and generation "
-            "parameters cannot be set here — use benchmark_run to "
+            "parameters cannot be set here — use benchmark_ollama_configs to "
             "vary them, or ollama_configure_model to bake them into a "
             "variant. Returns the generated text only, with no timings or "
-            "token counts; use benchmark_run when you need "
+            "token counts; use benchmark_ollama_single when you need "
             "measurements. Blocks "
             "for the whole generation with no timeout and no progress "
             "reporting, which for a large model or a long prompt can be "
@@ -884,7 +893,7 @@ def register_ollama_model_tools(server: MCPServer) -> None:
             "Create a new, separately named model from an existing one with "
             "Modelfile PARAMETER values baked in, for example temperature or "
             "num_ctx. Use this only when a persistent variant is wanted — for "
-            "trying parameters out, benchmark_run "
+            "trying parameters out, benchmark_ollama_configs "
             "applies them per request and creates nothing. Requires the Ollama "
             "service to be running and source_model to be installed, as "
             "printed by ollama_list_models. source_model is left completely "
@@ -967,15 +976,16 @@ def register_ollama_model_tools(server: MCPServer) -> None:
 
 
 # ============================================================
-# Benchmarking — MSHCore.benchmark (runner and history)
+# Benchmarking — MSHCore.benchmarks (modes, engine and history)
 # ============================================================
 
 def register_benchmark_tools(server: MCPServer) -> None:
     """Register benchmark history tools.
 
-    The benchmark itself — ``benchmark_run`` — is the tracked tool
-    bound to the progress panel in ``gui.app``; only the history it saves
-    its completed runs into is registered here as plain tools.
+    The benchmark itself — the four ``benchmark_ollama_*`` tools, one per
+    Benchmark Mode (single, configs, models, tournament) — are the tracked
+    tools bound to the progress panel in ``gui.app``; only the history every
+    mode saves its completed runs into is registered here as plain tools.
 
     Args:
         server: Server instance the tools are attached to.
@@ -986,7 +996,8 @@ def register_benchmark_tools(server: MCPServer) -> None:
         title="List saved benchmark runs",
         description=(
             "List every benchmark run kept in the history, newest first. "
-            "Every completed background benchmark — benchmark_run — "
+            "Every completed background benchmark — whichever of the four "
+            "benchmark_ollama_* modes ran — "
             "is saved here automatically, as is nothing else: the starting "
             "tool returns only a progress_id, no measurements. "
             "Read-only and cheap: the listing comes from a small index file, "

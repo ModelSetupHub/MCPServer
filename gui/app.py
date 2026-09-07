@@ -223,7 +223,8 @@ def register_progress_tools(server: Any) -> None:
         title="Get a finished benchmark's measurements",
         description=(
             "Retrieve the measurements produced by a benchmark started with "
-            "benchmark_run, "
+            "one of the four benchmark_ollama_* tools (single, configs, "
+            "models or tournament), "
             "by its progress_id. This is where a benchmark's actual results come "
             "from: the starting tool returns only a handle, and progress_get_status "
             "reports only progress. Call this once progress_get_status reports "
@@ -945,106 +946,348 @@ def _register_download(
 
 
 def _register_benchmarks(apps: Apps) -> None:
-    """Register the benchmark tool bound to the panel.
+    """Register the four benchmark tools bound to the panel.
+
+    One tool per Benchmark Mode of the WebApp's Benchmark tab — ``single``,
+    ``configs``, ``models`` and ``tournament`` — each starting exactly its own
+    mode's benchmark on its own progress bar. There is deliberately no generic
+    matrix tool: the mode a run belongs to is part of what the Agent is asking
+    for, so it names the tool rather than a parameter.
 
     Args:
-        apps: Extension the tool is added to.
+        apps: Extension the tools are added to.
     """
 
     @apps.tool(
         resource_uri=PROGRESS_URI,
-        name="benchmark_run",
-        title="Run a benchmark matrix",
+        name="benchmark_ollama_single",
+        title="Measure one model's speed",
         description=(
-            "Benchmark a matrix of models and configurations over a shared "
-            "prompt list — the one benchmark tool, covering everything from "
-            "a single model under one configuration to a full cross-model "
-            "comparison — running it in the background and showing a live "
-            "progress bar in the conversation with one row per "
-            "model-configuration pair (one row per prompt for the single "
-            "pair). Rows are weighted by the work they carry — the prompts "
-            "each pair answers — so the bar keeps step with the run. "
-            "experiments is a list of dicts, one per model in run order: "
-            "'model' (required) and 'configurations' (optional; each a dict "
-            "with 'name' and 'options'). A configuration without 'name' is "
-            "listed under 'configuration_<position>' and one without "
-            "'options' runs Ollama's defaults. Every configuration answers "
-            "the same shared_prompts — one prompt list for the whole matrix, "
-            "which is what makes the numbers comparable; a model with no "
-            "configurations runs once under its defaults. include_output "
-            "defaults to false and keeps only "
+            "Benchmark Mode 'single' — the plain speed test. Benchmarks "
+            "exactly ONE model under Ollama's own defaults over a shared "
+            "prompt list, running it in the background with a live progress "
+            "bar showing one row per prompt. Use this to answer 'how fast is "
+            "this model?' — nothing is compared and no parameters are varied. "
+            "For several parameter sets on one model use "
+            "benchmark_ollama_configs; for several models use "
+            "benchmark_ollama_models or benchmark_ollama_tournament. "
+            "model is an installed Ollama model name or tag exactly as "
+            "ollama_list_models prints it; prompts is the non-empty list of "
+            "prompt strings the model answers — every measurement is taken "
+            "against these, so prefer the smallest list that can tell the "
+            "answer apart. include_output defaults to false and keeps only "
             "measurements — pass true to keep each prompt's generated text "
-            "in the result. One "
-            "model carrying several configurations compares parameter sets; "
-            "several models under one shared configuration compare models. "
-            "Models run one after another — each is unloaded before the next "
-            "loads, so timings never compete for VRAM. Returns immediately "
-            "with a dict of 'progress_id', 'status' ('starting'), "
-            "'result_available' (false), 'models' (sorted names benchmarked), "
-            "'configurations' (how many model-configuration pairs will run), "
-            "'next_step' and 'contract' — an acknowledgement that "
-            "the benchmark has started, NOT its results, which do not exist "
-            "yet. Say that it "
-            "has started, end the turn and go to sleep; when the user calls "
+            "in the result. repetitions runs every prompt more than once and "
+            "reports the run-to-run spread. Returns immediately with a dict "
+            "of 'progress_id', 'status' ('starting'), 'result_available' "
+            "(false), 'mode', 'models', 'configurations', 'next_step' and "
+            "'contract' — an acknowledgement that the benchmark has started, "
+            "NOT its results, which do not exist yet. Say that it has "
+            "started, end the turn and go to sleep; when the user calls "
             "again, poll progress_get_status with that id until the status "
             "is 'completed', 'failed' or 'cancelled', then call "
             "benchmark_get_result with the same id to obtain the "
-            "side-by-side measurements and the two-way 'significance' "
-            "assessment ('by_model' and 'across_models'). repetitions runs "
-            "every prompt more than once per configuration and reports the "
-            "run-to-run spread, which is also what turns the significance "
-            "verdicts on. Total time is every pair's prompt count multiplied "
-            "by repetitions. Verify every model with ollama_list_models "
-            "first, and prefer the smallest prompt list that can tell the "
-            "subjects apart."
+            "measurements. The model is unloaded afterwards whatever the "
+            "outcome. Verify the model with ollama_list_models first."
         ),
         annotations=LONG_RUNNING,
     )
     @surface_core_errors
-    def benchmark_run(
-        experiments: list[dict],
-        shared_prompts: list[str],
+    def benchmark_ollama_single(
+        model: str,
+        prompts: list[str],
         include_output: bool = False,
         repetitions: int = 1,
     ) -> dict:
-        """Start a benchmark across a matrix of models and configurations.
+        """Start the single-model speed-test benchmark.
 
         Args:
-            experiments: One dict per model, shaped as
-                {"model": "llama3", "configurations": [{"name": "warm",
-                "options": {"temperature": 0.9}}]}.
-            shared_prompts: The prompts every configuration answers.
+            model: Installed Ollama model name or tag.
+            prompts: Prompt strings the model answers.
             include_output: Whether to keep generated text alongside metrics.
-            repetitions: How many times every prompt runs per configuration,
-                from 1.
+            repetitions: How many times every prompt runs, from 1.
 
         Returns:
             dict: The ``progress_id`` to poll, and the contract to follow.
 
         Raises:
-            ToolError: If no experiment was given, or one is malformed, or
-                shared_prompts is not a non-empty list of strings. Checked
-                here because the worker runs after this returns, so a bad
-                argument would otherwise surface only on the progress bar.
+            ToolError: If the model name is blank or prompts is not a
+                non-empty list of strings.
         """
-        experiments = _normalise_experiments(experiments, shared_prompts)
+        if not isinstance(model, str) or not model.strip():
+            raise ToolError("A model name is required.")
 
-        job = workers.start_benchmark(
-            experiments=experiments,
-            shared_prompts=shared_prompts,
+        _validate_prompts(prompts)
+
+        job = workers.start_benchmark_single(
+            model=model.strip(),
+            prompts=prompts,
             include_output=include_output,
             repetitions=repetitions,
         )
 
         return _benchmark_started(
             job,
-            models=sorted({experiment["model"] for experiment in experiments}),
-            # An experiment without 'configurations' still runs one pair —
-            # its model under Ollama's defaults — so it counts as one.
-            configurations=sum(
-                len(experiment.get("configurations") or []) or 1
-                for experiment in experiments
-            ),
+            mode="single",
+            models=[model.strip()],
+            configurations=1,
+        )
+
+    @apps.tool(
+        resource_uri=PROGRESS_URI,
+        name="benchmark_ollama_configs",
+        title="Compare configurations of one model",
+        description=(
+            "Benchmark Mode 'configs' — the configuration test. Benchmarks "
+            "ONE model under two or more temporary parameter sets (the "
+            "WebApp's 'Configuration test': one model ticked, several "
+            "configurations built), all answering the same prompt list, with "
+            "a live progress bar showing one weighted row per "
+            "configuration. Use this to tune generation parameters — "
+            "temperature, num_ctx, top_k, … — and learn which set is faster "
+            "and whether the gap beats the noise; the configurations are "
+            "applied per request and create nothing on disk (only "
+            "ollama_configure_model bakes a variant). For one model's raw "
+            "speed use benchmark_ollama_single; for comparing models use "
+            "benchmark_ollama_models or benchmark_ollama_tournament. model "
+            "is an installed Ollama model name or tag exactly as "
+            "ollama_list_models prints it. configurations is the list to "
+            "race: each entry a dict with optional 'name' (unnamed entries "
+            "are listed under 'configuration_<position>') and 'options' (an "
+            "Ollama options dict; omitted options mean Ollama's defaults). "
+            "prompts is the shared prompt list every configuration answers "
+            "— one list for the whole comparison is what makes the numbers "
+            "comparable. include_output defaults to false; repetitions runs "
+            "every prompt more than once per configuration and turns the "
+            "significance verdict from null into real-or-noise. Returns "
+            "immediately with 'progress_id', 'status' ('starting'), "
+            "'result_available' (false), 'mode', 'models', "
+            "'configurations' (how many will run), 'next_step' and "
+            "'contract' — an acknowledgement, NOT the results. Say that it "
+            "has started, end the turn and go to sleep; when the user calls "
+            "again, poll progress_get_status with that id until terminal, "
+            "then call benchmark_get_result with the same id for the "
+            "side-by-side measurements and the significance assessment. "
+            "Verify the model with ollama_list_models first."
+        ),
+        annotations=LONG_RUNNING,
+    )
+    @surface_core_errors
+    def benchmark_ollama_configs(
+        model: str,
+        configurations: list[dict],
+        prompts: list[str],
+        include_output: bool = False,
+        repetitions: int = 1,
+    ) -> dict:
+        """Start the one-model configuration comparison.
+
+        Args:
+            model: Installed Ollama model name or tag.
+            configurations: Dicts with optional 'name' and 'options'.
+            prompts: Prompt strings every configuration answers.
+            include_output: Whether to keep generated text alongside metrics.
+            repetitions: How many times every prompt runs per configuration.
+
+        Returns:
+            dict: The ``progress_id`` to poll, and the contract to follow.
+
+        Raises:
+            ToolError: If the arguments are malformed — checked here because
+                the worker runs after this returns.
+        """
+        if not isinstance(model, str) or not model.strip():
+            raise ToolError("A model name is required.")
+
+        _validate_configurations(model.strip(), configurations)
+        _validate_prompts(prompts)
+
+        job = workers.start_benchmark_configs(
+            model=model.strip(),
+            configurations=configurations,
+            prompts=prompts,
+            include_output=include_output,
+            repetitions=repetitions,
+        )
+
+        return _benchmark_started(
+            job,
+            mode="configs",
+            models=[model.strip()],
+            configurations=len(configurations),
+        )
+
+    @apps.tool(
+        resource_uri=PROGRESS_URI,
+        name="benchmark_ollama_models",
+        title="Compare several models",
+        description=(
+            "Benchmark Mode 'models' — the model comparison. Benchmarks TWO "
+            "or more models over the same prompt list under one shared "
+            "configuration (the WebApp's 'Model comparison': several models "
+            "ticked, no or one configuration), with a live progress bar "
+            "showing one weighted row per model. Use this to answer 'which "
+            "model is fastest?' on like terms. To vary parameters per model, "
+            "use benchmark_ollama_tournament instead; for one model alone, "
+            "benchmark_ollama_single or benchmark_ollama_configs. models is "
+            "the list of installed Ollama model names or tags to compare, "
+            "each exactly as ollama_list_models prints it, in run order. "
+            "config is the generation-parameter dict every model runs under "
+            "— omit it (or pass {}) so every model races Ollama's defaults, "
+            "which is the fairest cross-model question. prompts is the "
+            "shared prompt list every model answers. include_output defaults "
+            "to false; repetitions averages every prompt over several runs "
+            "and reports the run-to-run spread. Models run one after "
+            "another — each is unloaded before the next loads, so timings "
+            "never compete for VRAM. Returns immediately with "
+            "'progress_id', 'status' ('starting'), 'result_available' "
+            "(false), 'mode', 'models', 'configurations', 'next_step' and "
+            "'contract' — an acknowledgement, NOT the results. Say that it "
+            "has started, end the turn and go to sleep; when the user calls "
+            "again, poll progress_get_status with that id until terminal, "
+            "then call benchmark_get_result with the same id for the "
+            "side-by-side measurements and the 'across_models' significance "
+            "verdict. Verify every model with ollama_list_models first."
+        ),
+        annotations=LONG_RUNNING,
+    )
+    @surface_core_errors
+    def benchmark_ollama_models(
+        models: list[str],
+        prompts: list[str],
+        config: dict | None = None,
+        include_output: bool = False,
+        repetitions: int = 1,
+    ) -> dict:
+        """Start the multi-model comparison under one shared configuration.
+
+        Args:
+            models: Installed model names or tags, in run order.
+            prompts: Prompt strings every model answers.
+            config: Generation parameters shared by every model. Optional.
+            include_output: Whether to keep generated text alongside metrics.
+            repetitions: How many times every prompt runs per model.
+
+        Returns:
+            dict: The ``progress_id`` to poll, and the contract to follow.
+
+        Raises:
+            ToolError: If fewer than two usable models were given, or the
+                other arguments are malformed.
+        """
+        cleaned = _validate_models(models)
+        _validate_options(config, "config")
+        _validate_prompts(prompts)
+
+        job = workers.start_benchmark_models(
+            models=cleaned,
+            prompts=prompts,
+            config=config,
+            include_output=include_output,
+            repetitions=repetitions,
+        )
+
+        return _benchmark_started(
+            job,
+            mode="models",
+            models=cleaned,
+            configurations=len(cleaned),
+        )
+
+    @apps.tool(
+        resource_uri=PROGRESS_URI,
+        name="benchmark_ollama_tournament",
+        title="Run a model tournament",
+        description=(
+            "Benchmark Mode 'tournament' — each model races the "
+            "configuration paired with it (the WebApp's 'Tournament': "
+            "several models ticked AND several configurations built, each "
+            "model assigned one via the pairing table). Use this when each "
+            "model should be measured under its own best-fit settings — a "
+            "different question from benchmark_ollama_models, where one "
+            "shared configuration isolates the models themselves. models is "
+            "the list of installed Ollama model names or tags racing, each "
+            "exactly as ollama_list_models prints it, in run order. "
+            "model_configs pairs them: a dict keyed by model name whose "
+            "values are that model's Ollama options dict. A model missing "
+            "from the pairing falls back to the shared config argument, "
+            "mirroring the WebApp's positional fallback. prompts is the "
+            "shared prompt list every model answers even though their "
+            "settings differ. include_output defaults to false; repetitions "
+            "averages every prompt over several runs. Models run one after "
+            "another, each unloaded before the next loads. Returns "
+            "immediately with 'progress_id', 'status' ('starting'), "
+            "'result_available' (false), 'mode', 'models', "
+            "'configurations', 'next_step' and 'contract' — an "
+            "acknowledgement, NOT the results. Say that it has started, end "
+            "the turn and go to sleep; when the user calls again, poll "
+            "progress_get_status with that id until terminal, then call "
+            "benchmark_get_result with the same id for the measurements and "
+            "both significance halves ('by_model' and 'across_models'). "
+            "Verify every model with ollama_list_models first."
+        ),
+        annotations=LONG_RUNNING,
+    )
+    @surface_core_errors
+    def benchmark_ollama_tournament(
+        models: list[str],
+        prompts: list[str],
+        model_configs: dict | None = None,
+        config: dict | None = None,
+        include_output: bool = False,
+        repetitions: int = 1,
+    ) -> dict:
+        """Start the tournament: each model under its paired configuration.
+
+        Args:
+            models: Installed model names or tags, in run order.
+            prompts: Prompt strings every model answers.
+            model_configs: Per-model options keyed by model name. Optional.
+            config: Shared fallback options for unpaired models. Optional.
+            include_output: Whether to keep generated text alongside metrics.
+            repetitions: How many times every prompt runs per model.
+
+        Returns:
+            dict: The ``progress_id`` to poll, and the contract to follow.
+
+        Raises:
+            ToolError: If fewer than two usable models were given, or the
+                other arguments are malformed.
+        """
+        cleaned = _validate_models(models)
+
+        if model_configs is None:
+            model_configs = {}
+
+        if not isinstance(model_configs, dict):
+            raise ToolError("model_configs must be an object keyed by model name.")
+
+        for name, entry in model_configs.items():
+            if name not in cleaned:
+                raise ToolError(
+                    f"model_configs names '{name}', which is not among the "
+                    f"models racing."
+                )
+
+            _validate_options(entry, f"model_configs['{name}']")
+
+        _validate_options(config, "config")
+        _validate_prompts(prompts)
+
+        job = workers.start_benchmark_tournament(
+            models=cleaned,
+            prompts=prompts,
+            model_configs=model_configs,
+            config=config,
+            include_output=include_output,
+            repetitions=repetitions,
+        )
+
+        return _benchmark_started(
+            job,
+            mode="tournament",
+            models=cleaned,
+            configurations=len(cleaned),
         )
 
 
@@ -1122,82 +1365,113 @@ def _register_models(apps: Apps) -> None:
         return _model_started(job, model=model_name)
 
 
-def _normalise_experiments(
-    experiments: list[dict],
-    shared_prompts: list[str],
-) -> list[dict]:
-    """Validate the matrix before the worker starts.
+def _validate_prompts(prompts: list[str]) -> None:
+    """Check a benchmark's prompt list before the worker starts.
 
-    MSHCore normalises and validates these itself, but it does so on the worker
-    thread — after the tool has returned. Doing it here means a malformed
-    experiment is a tool error the model can act on, and a matrix with no
-    shared prompts fails now rather than as a failed progress bar. Prompts are
-    shared by design — one list for the whole matrix is what keeps the
-    configurations' numbers comparable — so a configuration carrying a
-    'prompts' key of its own is rejected outright.
+    MSHCore validates these itself, but on the worker thread — after the tool
+    has returned and the progress bar exists. Doing it here means a malformed
+    argument is a tool error the model can act on rather than a failed bar.
 
     Args:
-        experiments: Experiments as given to the tool.
-        shared_prompts: The prompts every configuration answers.
-
-    Returns:
-        list[dict]: The experiments as given, verified.
+        prompts: The prompts every configuration answers.
 
     Raises:
-        ToolError: If the list is empty, an entry is not usable, or
-            shared_prompts is not a non-empty list of strings.
+        ToolError: If the list is empty or holds a non-string.
     """
-    if not isinstance(experiments, list) or not experiments:
-        raise ToolError("At least one experiment is required.")
-
-    if not isinstance(shared_prompts, list) or not shared_prompts:
+    if not isinstance(prompts, list) or not prompts:
         raise ToolError(
-            "shared_prompts is required: every configuration answers the "
-            "same prompt list."
+            "prompts is required: every configuration answers the same "
+            "prompt list."
         )
 
-    if not all(isinstance(prompt, str) for prompt in shared_prompts):
-        raise ToolError("shared_prompts must be a list of strings.")
+    if not all(isinstance(prompt, str) for prompt in prompts):
+        raise ToolError("prompts must be a list of strings.")
 
-    for position, experiment in enumerate(experiments, start=1):
-        if not isinstance(experiment, dict):
-            raise ToolError(f"Experiment {position} must be an object.")
 
-        model = experiment.get("model")
+def _validate_options(options: dict | None, label: str) -> None:
+    """Check one generation-options dictionary.
 
-        if not isinstance(model, str) or not model.strip():
-            raise ToolError(f"Experiment {position} must name a model.")
+    Args:
+        options: The options to check; None means "not given".
+        label: Name of the argument, used in the error text.
 
-        configurations = experiment.get("configurations")
+    Raises:
+        ToolError: If the value is neither None nor a dict.
+    """
+    if options is not None and not isinstance(options, dict):
+        raise ToolError(f"{label} must be an object of Ollama options.")
 
-        if configurations is None:
-            continue
 
-        if not isinstance(configurations, list) or not configurations:
+def _validate_models(models: list[str]) -> list[str]:
+    """Check a multi-model run's model list and return it trimmed.
+
+    Args:
+        models: Model names as given to the tool.
+
+    Returns:
+        list[str]: The names, stripped, in run order.
+
+    Raises:
+        ToolError: If fewer than two usable names were given.
+    """
+    if not isinstance(models, list) or not models:
+        raise ToolError("A list of models is required.")
+
+    cleaned = []
+
+    for position, name in enumerate(models, start=1):
+        if not isinstance(name, str) or not name.strip():
+            raise ToolError(f"Model {position} must be a non-empty string.")
+
+        cleaned.append(name.strip())
+
+    if len(cleaned) < 2:
+        raise ToolError(
+            "At least two models are required to compare them; use "
+            "benchmark_ollama_single or benchmark_ollama_configs for one."
+        )
+
+    return cleaned
+
+
+def _validate_configurations(model: str, configurations: list[dict]) -> None:
+    """Check a configuration comparison's configuration list.
+
+    Prompts stay shared by design — one list for the whole comparison is what
+    keeps the configurations' numbers comparable — so a configuration
+    carrying a 'prompts' key of its own is rejected outright.
+
+    Args:
+        model: The model the configurations run under, for error text.
+        configurations: The configurations as given to the tool.
+
+    Raises:
+        ToolError: If the list is empty, an entry is not usable, or one
+            carries its own prompts.
+    """
+    if not isinstance(configurations, list) or not configurations:
+        raise ToolError(
+            f"At least one configuration is required to compare them under "
+            f"'{model}'."
+        )
+
+    for index, configuration in enumerate(configurations, start=1):
+        if not isinstance(configuration, dict):
             raise ToolError(
-                f"Experiment '{model}' must carry a non-empty configurations "
-                f"list, or none at all."
+                f"Configuration {index} of '{model}' must be an object."
             )
 
-        for index, configuration in enumerate(configurations, start=1):
-            if not isinstance(configuration, dict):
-                raise ToolError(
-                    f"Configuration {index} of '{model}' must be an object."
-                )
+        options = configuration.get("options", {})
 
-            options = configuration.get("options", {})
+        if not isinstance(options, dict):
+            raise ToolError(
+                f"Configuration {index} of '{model}' options must be an "
+                f"object."
+            )
 
-            if not isinstance(options, dict):
-                raise ToolError(
-                    f"Configuration {index} of '{model}' options must be an "
-                    f"object."
-                )
-
-            if "prompts" in configuration:
-                raise ToolError(
-                    f"Configuration {index} of '{model}' carries 'prompts', "
-                    f"but prompts are shared across every configuration: "
-                    f"pass them as shared_prompts instead."
-                )
-
-    return experiments
+        if "prompts" in configuration:
+            raise ToolError(
+                f"Configuration {index} of '{model}' carries 'prompts', "
+                f"but prompts are shared across every configuration: pass "
+                f"them as prompts instead."
+            )

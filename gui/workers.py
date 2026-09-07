@@ -34,7 +34,12 @@ from typing import Any, NamedTuple
 # class in memory, so a token handed to MSHCore and the OperationCancelled caught
 # back from it would come from different copies, and `except
 # OperationCancelled` would silently miss the cancellation.
-from MSHCore.benchmark import ollama_runner
+from MSHCore.benchmarks.ollama import (
+    benchmark_configs,
+    benchmark_models,
+    benchmark_single,
+    benchmark_tournament,
+)
 from MSHCore.cancellation import CancellationToken, OperationCancelled
 from MSHCore.download_manager.manager import DownloadManager
 from MSHCore.ollama import model as model_api
@@ -395,7 +400,7 @@ def note_download_ended(session_id: str, reason: str) -> bool:
 
 
 # ============================================================
-# Benchmarks
+# Benchmarks — the four Ollama Benchmark Modes
 # ============================================================
 
 class _Pair(NamedTuple):
@@ -414,21 +419,24 @@ class _Pair(NamedTuple):
     prompts: int
 
 
-def _matrix_plan(
-    experiments: list[dict],
+def _plan_pairs(
+    models: list[str],
+    configurations_per_model: list[list[tuple[int, str]]],
     shared_prompts: list[str] | None,
 ) -> list[_Pair]:
-    """Plan a matrix's model-configuration pairs the way MSHCore runs them.
+    """Lay out a mode's model-configuration pairs the way MSHCore runs them.
 
-    Mirrors the normalisation in ``ollama_runner.run_benchmark``: a model
-    with no configurations runs once under 'default', and an unnamed
-    configuration takes its position. Every pair answers the same
-    ``shared_prompts``, so all their prompt counts are one — the count is
-    still carried per pair, because MSHCore is the authority on what a pair
-    will run and the plan only mirrors it.
+    Every mode in this layer builds one experiment per model, each carrying
+    exactly one configuration, and every configuration answers the same
+    shared prompts — so the plan is one pair per model, weighted by that
+    prompt count. The pairing mirrors what the mode function normalises into
+    before running; MSHCore stays the authority on what actually executes.
 
     Args:
-        experiments: The matrix as given to the worker.
+        models: Model names, in run order.
+        configurations_per_model: One list of ``(position, name)`` entries
+            per model — one entry for every current mode, since each model
+            races under a single configuration.
         shared_prompts: The prompts every configuration answers.
 
     Returns:
@@ -437,85 +445,46 @@ def _matrix_plan(
     """
     shared = len(shared_prompts or [])
 
-    plan: list[_Pair] = []
-
-    for model_position, experiment in enumerate(experiments, start=1):
-        model = experiment["model"]
-        configurations = experiment.get("configurations")
-
-        if configurations is None:
-            plan.append(
-                _Pair(model_position, 1, model, "default", shared)
-            )
-            continue
-
-        for configuration_position, configuration in enumerate(
-            configurations, start=1
-        ):
-            if isinstance(configuration, dict):
-                name = configuration.get("name")
-            else:
-                name = None
-
-            plan.append(
-                _Pair(
-                    model_position,
-                    configuration_position,
-                    model,
-                    name if isinstance(name, str) and name else f"configuration_{configuration_position}",
-                    shared,
-                )
-            )
-
-    return plan
+    return [
+        _Pair(model_position, position, model, name, shared)
+        for model_position, (model, configurations) in enumerate(
+            zip(models, configurations_per_model), start=1
+        )
+        for position, name in configurations
+    ]
 
 
-def start_benchmark(
-    experiments: list[dict],
-    shared_prompts: list[str] | None,
-    include_output: bool,
-    repetitions: int = 1,
+def _start_benchmark_mode(
+    title: str,
+    message: str,
+    run: Callable[[CancellationToken, Callable[[dict], None] | None], dict],
+    pairs: list[_Pair],
+    repetitions: int,
 ) -> Job:
-    """Begin a benchmark matrix and run it on a worker thread.
+    """Start one benchmark mode with a live progress bar.
 
-    Calls ``ollama_runner.run_benchmark``, so MSHCore normalises the matrix
-    and this layer has one result shape to classify. The rows are laid out
-    from the same normalisation before MSHCore runs — one row per
-    model-configuration pair, weighted by the prompts that pair will answer,
-    so the bar moves in step with the work whatever the matrix's shape. Only
-    when the matrix is a single pair do the rows become the prompts
-    themselves, each advancing repetition by repetition.
+    The single implementation all four modes share: rows are laid out from
+    the planned pairs before MSHCore runs — one row per model-configuration
+    pair, weighted by the prompts that pair will answer, so the bar moves in
+    step with the work whatever the mode's shape. Only when the plan is a
+    single pair do the rows become the prompts themselves, each advancing
+    repetition by repetition.
 
     Args:
-        experiments: One dict per model, in run order: 'model' plus optional
-            'configurations', each carrying 'name' and 'options'.
-        shared_prompts: The prompts every configuration answers.
-        include_output: Whether to include generated text in the results.
-        repetitions: How many times every prompt runs per configuration, from 1.
+        title: Headline shown on the panel.
+        message: Secondary line shown under it.
+        run: Calls the mode's MSHCore function with the given cancellation
+            token and progress callback (or None) and returns its result.
+            Called on the worker thread.
+        pairs: The mode's planned pairs, in run order.
+        repetitions: How many times every prompt runs per configuration.
 
     Returns:
         Job: The job, already persisted, whose id the panel polls.
     """
-    pairs = _matrix_plan(experiments, shared_prompts)
-    models = _matrix_models(experiments)
     single = len(pairs) == 1 and pairs[0].prompts > 0
 
-    job = Job(
-        kind="benchmark",
-        title=(
-            f"Benchmarking {models[0]}"
-            if single or len(models) == 1
-            else f"Comparing {len(models)} model(s)"
-        ),
-        message=(
-            f"{pairs[0].prompts} prompt(s) · {pairs[0].name}"
-            if single
-            else (
-                f"{len(pairs)} configuration(s) · "
-                f"{sum(pair.prompts for pair in pairs)} prompt run(s) in total"
-            )
-        ),
-    )
+    job = Job(kind="benchmark", title=title, message=message)
 
     # The rows exist before MSHCore runs, so the very first poll shows the shape of
     # the work rather than an empty indeterminate bar. Every pair's weight is the
@@ -527,7 +496,7 @@ def start_benchmark(
     else:
         # One call per pair: add_steps weights every step it is given alike,
         # and the point here is that the pairs are not alike.
-        multi_model = len(models) > 1
+        multi_model = len({pair.model for pair in pairs}) > 1
 
         for pair in pairs:
             job.add_steps(
@@ -538,17 +507,10 @@ def start_benchmark(
     token = CancellationToken()
     job.set_cancel(token.cancel)
 
-    def run(cancellation: CancellationToken) -> dict:
-        return ollama_runner.run_benchmark(
-            experiments=experiments,
-            shared_prompts=shared_prompts,
-            include_output=include_output,
-            cancellation=cancellation,
-            repetitions=repetitions,
-            on_progress=_on_progress(
-                job,
-                plan=None if single else pairs,
-            ),
+    def worker(cancellation: CancellationToken) -> dict:
+        return run(
+            cancellation,
+            _on_progress(job, plan=None if single else pairs),
         )
 
     _spawn(
@@ -557,7 +519,7 @@ def start_benchmark(
             job=job,
             token=token,
             single=single,
-            run=run,
+            run=worker,
         ),
         name="benchmark",
     )
@@ -565,24 +527,205 @@ def start_benchmark(
     return job
 
 
-def _matrix_models(experiments: list[dict]) -> list[str]:
-    """List a matrix's distinct model names, in run order.
+def start_benchmark_single(
+    model: str,
+    prompts: list[str],
+    include_output: bool,
+    repetitions: int = 1,
+) -> Job:
+    """Benchmark Mode 'single': measure one model's speed over prompts.
+
+    Calls ``MSHCore.benchmarks.ollama.benchmark_single``, which runs the model once
+    under its defaults; the rows become the prompts themselves.
 
     Args:
-        experiments: The matrix as given to the worker.
+        model: The model to measure.
+        prompts: The prompts it answers.
+        include_output: Whether to include generated text in the results.
+        repetitions: How many times every prompt runs, from 1.
 
     Returns:
-        list[str]: First occurrence of each model name.
+        Job: The job, already persisted, whose id the panel polls.
     """
-    models: list[str] = []
+    return _start_benchmark_mode(
+        title=f"Benchmarking {model}",
+        message=f"{len(prompts)} prompt(s) · {model} (defaults)",
+        run=lambda cancellation, on_progress: benchmark_single(
+            model=model,
+            prompts=prompts,
+            include_output=include_output,
+            cancellation=cancellation,
+            repetitions=repetitions,
+            on_progress=on_progress,
+        ),
+        pairs=_plan_pairs(
+            [model], [[(1, "default")]], prompts
+        ),
+        repetitions=repetitions,
+    )
 
-    for experiment in experiments:
-        model = experiment["model"]
 
-        if model not in models:
-            models.append(model)
+def start_benchmark_configs(
+    model: str,
+    configurations: list[dict],
+    prompts: list[str],
+    include_output: bool,
+    repetitions: int = 1,
+) -> Job:
+    """Benchmark Mode 'configs': compare configurations of one model.
 
-    return models
+    Calls ``MSHCore.benchmarks.ollama.benchmark_configs``; one row per
+    configuration, weighted by the prompts each answers.
+
+    Args:
+        model: The model every configuration runs under.
+        configurations: Dicts with optional 'name' and 'options'.
+        prompts: The prompts every configuration answers.
+        include_output: Whether to include generated text in the results.
+        repetitions: How many times every prompt runs per configuration.
+
+    Returns:
+        Job: The job, already persisted, whose id the panel polls.
+    """
+    names = [
+        (
+            configuration.get("name")
+            if isinstance(configuration.get("name"), str)
+            and configuration.get("name")
+            else f"configuration_{position}"
+        )
+        for position, configuration in enumerate(configurations, start=1)
+    ]
+
+    return _start_benchmark_mode(
+        title=f"Benchmarking {model}",
+        message=(
+            f"{len(configurations)} configuration(s) · "
+            f"{len(configurations) * len(prompts)} prompt run(s) in total"
+        ),
+        run=lambda cancellation, on_progress: benchmark_configs(
+            model=model,
+            configurations=configurations,
+            prompts=prompts,
+            include_output=include_output,
+            cancellation=cancellation,
+            repetitions=repetitions,
+            on_progress=on_progress,
+        ),
+        pairs=_plan_pairs(
+            [model], [list(enumerate(names, start=1))], prompts
+        ),
+        repetitions=repetitions,
+    )
+
+
+def start_benchmark_models(
+    models: list[str],
+    prompts: list[str],
+    config: dict | None,
+    include_output: bool,
+    repetitions: int = 1,
+) -> Job:
+    """Benchmark Mode 'models': compare several models under one configuration.
+
+    Calls ``MSHCore.benchmarks.ollama.benchmark_models``; one row per model, each
+    racing under the shared configuration (or Ollama's defaults).
+
+    Args:
+        models: The models to compare, in run order.
+        prompts: The prompts every model answers.
+        config: Generation parameters shared by every model.
+        include_output: Whether to include generated text in the results.
+        repetitions: How many times every prompt runs per model.
+
+    Returns:
+        Job: The job, already persisted, whose id the panel polls.
+    """
+    label = "default" if not config else "shared configuration"
+
+    return _start_benchmark_mode(
+        title=f"Comparing {len(models)} model(s)",
+        message=(
+            f"{len(models)} model(s) · "
+            f"{len(models) * len(prompts)} prompt run(s) in total"
+        ),
+        run=lambda cancellation, on_progress: benchmark_models(
+            models=models,
+            prompts=prompts,
+            config=config,
+            include_output=include_output,
+            cancellation=cancellation,
+            repetitions=repetitions,
+            on_progress=on_progress,
+        ),
+        pairs=_plan_pairs(
+            models,
+            [[(1, label)] for _ in models],
+            prompts,
+        ),
+        repetitions=repetitions,
+    )
+
+
+def start_benchmark_tournament(
+    models: list[str],
+    prompts: list[str],
+    model_configs: dict[str, dict] | None,
+    config: dict | None,
+    include_output: bool,
+    repetitions: int = 1,
+) -> Job:
+    """Benchmark Mode 'tournament': each model races its paired configuration.
+
+    Calls ``MSHCore.benchmarks.ollama.benchmark_tournament``; one row per model,
+    labelled by the configuration it actually races under.
+
+    Args:
+        models: The models racing, in run order.
+        prompts: The prompts every model answers.
+        model_configs: Per-model overrides keyed by model name.
+        config: Shared fallback options for unpaired models.
+        include_output: Whether to include generated text in the results.
+        repetitions: How many times every prompt runs per model.
+
+    Returns:
+        Job: The job, already persisted, whose id the panel polls.
+    """
+    overrides = dict(model_configs or {})
+
+    labels = []
+
+    for model in models:
+        if model in overrides:
+            labels.append("own configuration")
+        elif config:
+            labels.append("shared configuration")
+        else:
+            labels.append("default")
+
+    return _start_benchmark_mode(
+        title=f"Tournament across {len(models)} model(s)",
+        message=(
+            f"{len(models)} model(s) · "
+            f"{len(models) * len(prompts)} prompt run(s) in total"
+        ),
+        run=lambda cancellation, on_progress: benchmark_tournament(
+            models=models,
+            prompts=prompts,
+            model_configs=overrides,
+            config=config,
+            include_output=include_output,
+            cancellation=cancellation,
+            repetitions=repetitions,
+            on_progress=on_progress,
+        ),
+        pairs=_plan_pairs(
+            models,
+            [[(1, label)] for label in labels],
+            prompts,
+        ),
+        repetitions=repetitions,
+    )
 
 
 def _pair_label(model: str, name: str, multi_model: bool) -> str:
@@ -822,7 +965,7 @@ def _business_result(result: dict) -> dict:
     when it is stored: the benchmark history keeps every comparison whole.
 
     Args:
-        result: Return value of ``ollama_runner.run_benchmark``.
+        result: Return value of the benchmark mode run through MSHCore.
 
     Returns:
         dict: The measurements the model reads.
@@ -844,7 +987,7 @@ def _benchmark_error(result: dict) -> str | None:
     and the failed rows carry their own errors.
 
     Args:
-        result: Return value of ``ollama_runner.run_benchmark``.
+        result: Return value of the benchmark mode run through MSHCore.
 
     Returns:
         str | None: The first error found, or None when the run succeeded.
@@ -875,7 +1018,7 @@ def _close_benchmark_steps(job: Job, result: dict, single: bool) -> None:
 
     Args:
         job: Job whose rows are being closed.
-        result: Return value of ``ollama_runner.run_benchmark``.
+        result: Return value of the benchmark mode run through MSHCore.
         single: Whether the rows are prompts rather than configurations.
     """
     tests = result.get("tests") or []

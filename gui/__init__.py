@@ -10,7 +10,7 @@ Everything to do with the in-chat progress panel, kept out of ``main.py``:
   in the benchmark history.
 - ``workers`` — the threads that run the operations and keep their jobs current,
   fed by MSHCore's own progress reporting: the download manager's status for
-  downloads, the benchmark runner's ``on_progress`` callback for benchmarks.
+  downloads, the benchmark modes' ``on_progress`` callback for benchmarks.
 - ``app`` — the Apps extension: the ``ui://`` resource plus the tools bound to it,
   and ``register_progress_tools`` for the plain tools the model polls with.
 
@@ -39,7 +39,10 @@ from .app import (
 from .workers import (
     note_download_ended,
     start_add_model,
-    start_benchmark,
+    start_benchmark_configs,
+    start_benchmark_models,
+    start_benchmark_single,
+    start_benchmark_tournament,
     start_download,
 )
 
@@ -49,6 +52,9 @@ __all__ = [
     "register_progress_tools",
     "note_download_ended",
     "start_add_model",
-    "start_benchmark",
+    "start_benchmark_configs",
+    "start_benchmark_models",
+    "start_benchmark_single",
+    "start_benchmark_tournament",
     "start_download",
 ]
