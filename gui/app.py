@@ -948,11 +948,11 @@ def _register_download(
 def _register_benchmarks(apps: Apps) -> None:
     """Register the four benchmark tools bound to the panel.
 
-    One tool per Benchmark Mode of the WebApp's Benchmark tab — ``single``,
-    ``configs``, ``models`` and ``tournament`` — each starting exactly its own
-    mode's benchmark on its own progress bar. There is deliberately no generic
-    matrix tool: the mode a run belongs to is part of what the Agent is asking
-    for, so it names the tool rather than a parameter.
+    One tool per Benchmark Mode of MSHCore — ``single``, ``configs``,
+    ``models`` and ``tournament`` — each starting exactly its own mode's
+    benchmark on its own progress bar. There is deliberately no generic
+    matrix tool: the mode a run belongs to is part of what the Agent is
+    asking for, so it names the tool rather than a parameter.
 
     Args:
         apps: Extension the tools are added to.
@@ -1039,9 +1039,8 @@ def _register_benchmarks(apps: Apps) -> None:
         title="Compare configurations of one model",
         description=(
             "Benchmark Mode 'configs' — the configuration test. Benchmarks "
-            "ONE model under two or more temporary parameter sets (the "
-            "WebApp's 'Configuration test': one model ticked, several "
-            "configurations built), all answering the same prompt list, with "
+            "ONE model under two or more temporary parameter sets, all "
+            "answering the same prompt list, with "
             "a live progress bar showing one weighted row per "
             "configuration. Use this to tune generation parameters — "
             "temperature, num_ctx, top_k, … — and learn which set is faster "
@@ -1124,8 +1123,7 @@ def _register_benchmarks(apps: Apps) -> None:
         description=(
             "Benchmark Mode 'models' — the model comparison. Benchmarks TWO "
             "or more models over the same prompt list under one shared "
-            "configuration (the WebApp's 'Model comparison': several models "
-            "ticked, no or one configuration), with a live progress bar "
+            "configuration, with a live progress bar "
             "showing one weighted row per model. Use this to answer 'which "
             "model is fastest?' on like terms. To vary parameters per model, "
             "use benchmark_ollama_tournament instead; for one model alone, "
@@ -1200,9 +1198,7 @@ def _register_benchmarks(apps: Apps) -> None:
         title="Run a model tournament",
         description=(
             "Benchmark Mode 'tournament' — each model races the "
-            "configuration paired with it (the WebApp's 'Tournament': "
-            "several models ticked AND several configurations built, each "
-            "model assigned one via the pairing table). Use this when each "
+            "configuration paired with it. Use this when each "
             "model should be measured under its own best-fit settings — a "
             "different question from benchmark_ollama_models, where one "
             "shared configuration isolates the models themselves. models is "
@@ -1210,8 +1206,8 @@ def _register_benchmarks(apps: Apps) -> None:
             "exactly as ollama_list_models prints it, in run order. "
             "model_configs pairs them: a dict keyed by model name whose "
             "values are that model's Ollama options dict. A model missing "
-            "from the pairing falls back to the shared config argument, "
-            "mirroring the WebApp's positional fallback. prompts is the "
+            "from the pairing falls back to the shared config argument. "
+            "prompts is the "
             "shared prompt list every model answers even though their "
             "settings differ. include_output defaults to false; repetitions "
             "averages every prompt over several runs. Models run one after "
@@ -1294,10 +1290,9 @@ def _register_benchmarks(apps: Apps) -> None:
 def _register_models(apps: Apps) -> None:
     """Register the model-import tool bound to the panel.
 
-    ``ollama_add_model`` is the tracked form of the import MSHCore used to
-    expose as a blocking call: it starts a job, shows the bar, and returns the
-    handle. Only the starting form lives here; there is no separate plain
-    tool to migrate a session to.
+    ``ollama_add_model`` is the tracked form of MSHCore's model import: it
+    starts a job, shows the bar, and returns the handle. Only the starting
+    form lives here; there is no separate plain tool to migrate a session to.
 
     Args:
         apps: Extension the tool is added to.
