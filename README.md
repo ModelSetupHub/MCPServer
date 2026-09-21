@@ -27,7 +27,7 @@ library, so they can be used interchangeably on the same machine.
 
 ## What the agent can do
 
-60 tools in total. All of them are direct pass-throughs to the toolkit, so the agent gets the same capabilities a
+63 tools in total. All of them are direct pass-throughs to the toolkit, so the agent gets the same capabilities a
 script would, grouped by area:
 
 - **System** — scan the machine, or read just the memory, storage, GPU or CUDA details.
@@ -79,7 +79,9 @@ held in memory. Operations with nothing measurable to report — installations, 
 ## Requirements
 
 - Python 3.10 or newer
-- Windows for the full feature set. Hardware detection relies on PowerShell and WMI, and GPU detection on `nvidia-smi`.
+- Windows or Linux. On Windows, hardware detection reads WMI through PowerShell and GPU detection uses `nvidia-smi`.
+  On Linux it reads `/proc`, `os-release` and, where present, `lscpu` and `dmidecode`; GPU detection still uses
+  `nvidia-smi`. RAM module detail on Linux needs `dmidecode` and root, and is reported as empty without them.
 - Git, to fetch the `Core` submodule
 - An MCP-capable client
 
@@ -122,16 +124,19 @@ configuration:
   "mcpServers": {
     "modelsetuphub": {
       "command": "python",
-      "args": ["C:/path/to/MCPServer/main.py"]
+      "args": ["/home/you/MCPServer/main.py"]
     }
   }
 }
 ```
 
+Use the absolute path to `main.py` for your own machine — `C:/path/to/MCPServer/main.py` on Windows, or
+`/home/you/MCPServer/main.py` on Linux.
+
 If Claude Desktop is your client, `utils/claude_setup.py` does that registration for you. It is a small standalone
 desktop app — not an MCP tool — that can install Claude Desktop, find your Python interpreter and configuration file
-automatically, and add or remove MCP servers, backing the configuration up before every change. It needs Windows for
-detection and installation:
+automatically, and add or remove MCP servers, backing the configuration up before every change. It reads the Claude
+Desktop installation from the Windows registry, so it runs on Windows:
 
 ```bash
 python utils/claude_setup.py
