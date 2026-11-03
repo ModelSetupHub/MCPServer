@@ -9,7 +9,8 @@ your GPU, and hunting for the parameters that make it fast, you describe the goa
 system* — and the agent uses these tools to inspect your hardware, manage Ollama, download and configure models, and
 benchmark settings against each other.
 
-It speaks the Model Context Protocol, so it plugs into any MCP-capable client, Claude Desktop included.
+It speaks the Model Context Protocol, so it plugs into any MCP-capable client, Claude Desktop included. It runs on
+Windows and Linux alike.
 
 ## Where this fits
 
